@@ -99,6 +99,29 @@ def load_dials(name: str = "normal") -> dict[str, float]:
     return dict(_NORMAL_DIAL)
 
 
+def notifications_configured() -> bool:
+    """
+    True when vnpy has a notification channel set up: e-mail credentials in
+    ``vt_setting.json`` (``email.username`` + ``email.receiver``) or a WeChat
+    bot in ``wechat_setting.json``.  Without one, ``main_engine
+    .send_notification`` would start an ``EmailEngine`` thread that opens
+    ``smtplib.SMTP_SSL`` with no socket timeout, and ``MainEngine.close()``
+    then blocks on joining it - so callers skip the push and only log.
+    """
+    try:
+        from vnpy.trader.setting import SETTINGS
+        from vnpy.trader.utility import load_json
+    except Exception:  # noqa: BLE001 - vnpy not importable: nothing to push through
+        return False
+    try:
+        if SETTINGS.get("email.username") and SETTINGS.get("email.receiver"):
+            return True
+        wechat = load_json("wechat_setting.json")
+        return bool(wechat.get("bot_id") and wechat.get("token"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _log(strategy: Any, msg: str) -> None:
     """Log through the strategy when possible, else print."""
     try:
@@ -543,7 +566,7 @@ class RiskGuard:
     def notify(self, msg: str) -> None:
         """Push through main_engine.send_notification when live; always log."""
         self.log(msg)
-        if not self.live:
+        if not self.live or not notifications_configured():
             return
         try:
             self.strategy.cta_engine.main_engine.send_notification(msg, f"{self.name} risk")
@@ -1119,6 +1142,7 @@ __all__ = [
     "get_equity",
     "guarded",
     "load_dials",
+    "notifications_configured",
     "reconcile",
     "ts_of",
 ]

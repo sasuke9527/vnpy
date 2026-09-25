@@ -83,6 +83,7 @@ from vnpy_ctastrategy import CtaEngine, CtaStrategyApp  # noqa: E402
 from vnpy_ctastrategy.template import CtaTemplate  # noqa: E402
 
 import download_data as dl  # noqa: E402
+import risk  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -364,6 +365,10 @@ def heartbeat_ts(name: str) -> float | None:
 def notify(main_engine: MainEngine, content: str, subject: str) -> None:
     """``main_engine.send_notification`` (email / wechat if configured); never raises."""
     log(f"NOTIFY {subject}: {content}", "CRITICAL")
+    if not risk.notifications_configured():
+        log("no email/wechat channel configured (vt_setting.json email.* / wechat_setting.json); "
+            "notification logged only", "WARNING")
+        return
     try:
         main_engine.send_notification(content, subject)
     except Exception as exc:  # noqa: BLE001

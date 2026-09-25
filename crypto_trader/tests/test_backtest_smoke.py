@@ -151,7 +151,7 @@ def _assert_clean(run: Run) -> None:
 
 
 def _assert_orders(run: Run, all_orders_min_notional: bool = False) -> None:
-    for oid, offset, price, vol, notional in run.orders_at_send:
+    for oid, offset, _price, vol, notional in run.orders_at_send:
         units = vol / STEP
         assert abs(units - round(units)) < 1e-6, f"order {oid} volume {vol} is not a multiple of {STEP}"
         assert vol > 0

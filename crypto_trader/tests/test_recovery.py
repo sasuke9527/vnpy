@@ -275,7 +275,8 @@ def test_exchange_size_differs_adopts_and_rearms(warmup_bars: list[BarData]) -> 
     s.on_tick(make_tick(last))
     assert s.pos == 0.020
     assert s.entry_price == 3005.0
-    assert s.highest_since_entry == exp.highest_since_entry == max(3000.0, 3005.0, last)
+    assert exp.highest_since_entry == max(3000.0, 3005.0, last)
+    assert s.highest_since_entry == 3013.0, "bar high of the first 1m bar is applied after the adopt"
     assert s.lowest_since_entry == exp.lowest_since_entry
     # stop recomputed from the current ATR below the adopted entry
     assert 0 < s.stop_price < 3005.0
@@ -306,7 +307,12 @@ def test_short_adopted_from_flat(warmup_bars: list[BarData]) -> None:
     assert stops[0]["volume"] == 0.030 and stops[0]["price"] == s.stop_price
 
 
-def test_desync_with_two_strategies_halts_without_orders(warmup_bars: list[BarData]) -> None:
+def test_desync_with_two_strategies_halts_without_orders(warmup_bars: list[BarData],
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    from vnpy.trader.setting import SETTINGS
+
+    monkeypatch.setitem(SETTINGS, "email.username", "bot@example.com")
+    monkeypatch.setitem(SETTINGS, "email.receiver", "owner@example.com")
     engine = FakeCtaEngine(warmup_bars, n_strategies=2)
     engine.main_engine.set_position(0.020, 3005.0)
     s = restart(engine, stale_state(0.016, 3000.0, 2940.0))
@@ -326,6 +332,17 @@ def test_desync_with_two_strategies_halts_without_orders(warmup_bars: list[BarDa
     (Path(s.guard.state_dir) / "RESUME").write_text("1", encoding="utf-8")
     s.on_tick(make_tick(3011.0, FIRST_TICK_DT + timedelta(seconds=6)))
     assert not s.halted and s.halt_reason == ""
+
+
+def test_desync_without_notification_channel_only_logs(warmup_bars: list[BarData]) -> None:
+    """No email / wechat configured: the halt is logged, send_notification is never called (it would hang close())."""
+    engine = FakeCtaEngine(warmup_bars, n_strategies=2)
+    engine.main_engine.set_position(0.020, 3005.0)
+    s = restart(engine, stale_state(0.016, 3000.0, 2940.0))
+    s.on_tick(make_tick(3010.0))
+    assert s.halted and s.halt_reason == "DESYNC"
+    assert not engine.main_engine.notifications
+    assert any("HALT DESYNC" in m for m in engine.logs)
 
 
 def test_missing_stop_price_is_recomputed(warmup_bars: list[BarData]) -> None:
