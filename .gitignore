@@ -41,3 +41,9 @@ _templates
 # Alpha
 lab/
 /.mypy_cache
+
+# crypto_trader runtime
+crypto_trader/.env
+crypto_trader/.vntrader/
+crypto_trader/data/
+*.db

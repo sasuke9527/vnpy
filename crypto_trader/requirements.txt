@@ -1,0 +1,9 @@
+# Pinned to the versions verified headless on Linux/Python 3.11 (2026-09-25)
+vnpy==4.4.0
+vnpy_ctastrategy==1.4.1
+vnpy_ctabacktester==1.3.0
+vnpy_binance==2026.8.5
+vnpy_okx==2026.6.10
+vnpy_sqlite==1.1.3
+vnpy_datamanager==1.2.0
+requests>=2.32
