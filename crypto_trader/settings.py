@@ -291,8 +291,8 @@ def gateway_class(exchange: str | None = None) -> type:
     exchange = exchange or exchange_from_env()
     cls: type
     if exchange == "binance_linear":
-        from vnpy_binance import BinanceLinearGateway
-        cls = BinanceLinearGateway
+        from gateways import ReduceOnlyBinanceLinearGateway   # closes are sent reduceOnly (MIN_NOTIONAL exempt)
+        cls = ReduceOnlyBinanceLinearGateway
     elif exchange == "okx":
         from vnpy_okx import OkxGateway
         cls = OkxGateway

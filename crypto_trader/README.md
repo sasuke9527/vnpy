@@ -118,6 +118,9 @@ QT_QPA_PLATFORM=offscreen python run_live.py --dry-run
 
 1. 开通 **USDT-M 合约**账户，划转 50 USDT 到合约钱包。
 2. 持仓模式设为**单向持仓（One-way）**。对冲模式（Hedge）下网关发出的订单没有 `positionSide`，会被 `-4061` 拒绝，且仓位推送被忽略。
+   实盘网关是 `gateways.ReduceOnlyBinanceLinearGateway`（`vnpy_binance` 的子类）：所有平仓单（止损子单、限价追单）都带 `reduceOnly=true`，
+   因此低于 `MIN_NOTIONAL`（ETHUSDT 20 USDT）的残余仓位也能平掉（`-4164` 只针对非 reduce-only 单），而且平仓单永远不会把仓位反向开出来。
+   `reduceOnly` 只有单向持仓模式接受——这是必须用 One-way 的另一个原因。
 3. 保证金模式设为**全仓（Cross）**。
 4. 手动把交易品种（ETHUSDT）的**杠杆设为 10×**。这不是策略杠杆——策略自己限制名义仓位 ≤ `max_leverage`×余额（normal 旋钮 3×）；
    交易所杠杆设为 ≥ 2×`max_leverage` 只是为了初始保证金永远不会拒单。
@@ -188,6 +191,8 @@ python download_data.py --exchange okx --symbol ETHUSDT --interval 1m --start 20
 `backtest.py` 用 `BacktestingEngine(interval=Interval.MINUTE)` 跑单个策略/品种/区间，做三档手续费（`rate ∈ {0.0004, 0.0005, 0.0007}`），
 从 `engine.get_all_trades()` 回推每 8 小时（00/08/16 UTC）的资金费率成本（无资金费率文件时用 0.0001/8h，压力测试 ×2），
 再在 fit（2023–2024）/ validate（2025）/ test（2026 至今）上评估，并对每个策略仅有的三个可调参数做 3×3×3 网格。参数用法见 `backtest.py` 文件头部说明。
+回放中途异常终止或策略记录了异常的回测：验收表第一行直接 FAIL，退出码 3，网格中该格的目标值记为 `-inf`（不参与排名）——截断的结果永远不算通过。
+R 期望值与"去掉最好的 5 % 交易"都按引擎的滑点（每个来回 `2 × 数量 × slippage`）扣减，与引擎的 `total_net_pnl` 口径一致。
 
 **在投入任何实盘资金之前，每个策略、每个品种都必须在 `normal` 旋钮、`rate=0.0005`、扣除资金费率后满足全部条件：**
 
@@ -238,13 +243,15 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python run_live.py            # 前台
 ```
 
 `run_live.py` 的启动流程：刷新 `exchange_filters.json` → 创建 `MainEngine` + 网关 + `CtaStrategyApp` → `connect` →
-等待合约信息（≤ 120 s，OKX 再等 3 s 让 WebSocket 连上）→ `cta.init_engine()`（重新加载已保存的策略）→ 补齐 `DEPLOYMENT` 里缺少的策略、按 `.env` 刷新旋钮 →
+等待合约信息（≤ 120 s，OKX 再等 3 s 让 WebSocket 连上）→ **等待 `<网关>.USDT` 账户快照**（≤ 60 s，没有则退出码 4：仓位对账在账户数据到达前不会执行）→
+`cta.init_engine()`（重新加载已保存的策略）→ 补齐 `DEPLOYMENT` 里缺少的策略、按 `.env` 刷新旋钮 →
 **撤销部署品种上的所有孤儿挂单**（上一进程留下的挂单成交后不会进入 `pos`；本地止损单已随进程消失）→ 每个策略 `init_strategy(...).result(timeout=600)` 后立刻 `start_strategy` →
 看门狗循环。
 
 看门狗（每 10 s）：
 
-- 策略 `trading` 变为 False（引擎在回调异常时同时清掉 `inited` 和 `trading`）→ 重新 `init_strategy` + `start_strategy`（状态已持久化，幂等）。
+- 策略 `trading` 变为 False（引擎在回调异常时同时清掉 `inited` 和 `trading`）→ **先撤销引擎里仍登记在该策略名下的所有委托（包括本地止损单，引擎异常停机时不会撤单）**，
+  再 `init_strategy` + `start_strategy`（状态已持久化，幂等）；第一笔 tick 重新挂唯一的一张保护止损。预热失败（`load_bar` 异常、指标为空）的策略不会被启动，而是等下一轮重试。
   每个策略每滚动小时最多 3 次；第 4 次写入 `.vntrader/KILL`、`main_engine.send_notification`，**退出码 2**。
 - `heartbeat_<name>` 超过 180 s 没更新（策略每 10 s 的 tick 写一次）→ **退出码 3**，让 systemd/launchd 重启进程。
 - SIGINT/SIGTERM → 停止策略（撤销该策略的所有挂单、持久化变量）、关闭网关、退出码 0。
@@ -354,7 +361,8 @@ Mac 需关闭睡眠（`sudo pmset -a sleep 0 disablesleep 1`）或者干脆用 V
 
 ## 11. 开关文件（`.vntrader/` 下的空文件）
 
-策略每根管理 K 线和每 5 秒的 tick 检查一次这些文件（`risk.RiskGuard.check_flags`）：
+策略每根管理 K 线和每 5 秒的 tick 检查一次这些文件（`risk.RiskGuard.check_flags`）。**只有实盘读取这些文件**：
+回测（`backtest.py`、网格 worker、pytest）既不响应也不删除它们，所以影子阶段（`PAUSE` 存在时）照常可以跑回测。
 
 | 文件 | 作用 |
 |---|---|

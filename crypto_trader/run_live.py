@@ -90,6 +90,7 @@ import risk  # noqa: E402
 # ---------------------------------------------------------------------------
 
 CONTRACT_WAIT_SECS: float = 120.0
+ACCOUNT_WAIT_SECS: float = 60.0
 OKX_WS_SETTLE_SECS: float = 3.0
 ORDER_QUERY_SETTLE_SECS: float = 3.0
 ORPHAN_SETTLE_SECS: float = 2.0
@@ -278,6 +279,27 @@ def wait_for_contracts(main_engine: MainEngine, vt_symbols: Sequence[str],
     return True
 
 
+def wait_for_account(main_engine: MainEngine, gateway_name: str, timeout: float = ACCOUNT_WAIT_SECS) -> bool:
+    """
+    Poll ``get_account(<gateway>.USDT)``: both gateways deliver the account
+    right before the position snapshot, and ``RiskGuard.reconcile_live``
+    refuses to run until it is there.  ``False`` on timeout (startup aborts:
+    a strategy that cannot reconcile must not trade).
+    """
+    vt_accountid = f"{gateway_name}.USDT"
+    deadline = time.time() + timeout
+    while time.time() < deadline and not _stop_requested:
+        acct = main_engine.get_account(vt_accountid)
+        if acct is not None:
+            log(f"account {vt_accountid}: balance={acct.balance} frozen={acct.frozen}; "
+                f"positions known: {[(p.vt_symbol, p.volume) for p in main_engine.get_all_positions()]}")
+            return True
+        time.sleep(1.0)
+    log(f"account {vt_accountid} not received within {timeout:.0f}s (no USDT balance, wrong keys or "
+        f"permissions?); refusing to start", "ERROR")
+    return False
+
+
 def cancel_orphans(main_engine: MainEngine, vt_symbols: Sequence[str]) -> int:
     """Cancel every active order on the deployed symbols (orders of a previous process are orphans)."""
     symbols = set(vt_symbols)
@@ -334,9 +356,34 @@ def ensure_strategies(cta_engine: CtaEngine,
     return problems
 
 
+def cancel_strategy_orders(cta_engine: CtaEngine, name: str) -> int:
+    """
+    Cancel every order the engine still tracks for ``name`` (engine level, so
+    it works while ``trading`` is False).  After a callback exception the
+    engine clears ``trading``/``inited`` but cancels nothing, and
+    ``stop_strategy`` returns early: without this a re-initialised strategy
+    would arm a second local stop next to the old one and both would fire.
+    Returns the number of cancels issued; sleeps for server cancels.
+    """
+    strategy: CtaTemplate = cta_engine.strategies[name]
+    tracked = list(cta_engine.strategy_orderid_map.get(name, set()))
+    if not tracked:
+        return 0
+    server = 0
+    for oid in tracked:
+        log(f"{name}: cancelling tracked order {oid} before re-init", "WARNING")
+        cta_engine.cancel_order(strategy, oid)
+        if not oid.startswith("STOP"):
+            server += 1
+    if server:
+        time.sleep(ORPHAN_SETTLE_SECS)
+    return len(tracked)
+
+
 def init_and_start(cta_engine: CtaEngine, name: str) -> bool:
     """``init_strategy`` (blocking on its Future) then ``start_strategy``; ``True`` when trading."""
     strategy: CtaTemplate = cta_engine.strategies[name]
+    cancel_strategy_orders(cta_engine, name)
     try:
         cta_engine.init_strategy(name).result(timeout=INIT_TIMEOUT_SECS)
     except Exception as exc:  # noqa: BLE001 - timeout or a crash inside on_init
@@ -344,6 +391,13 @@ def init_and_start(cta_engine: CtaEngine, name: str) -> bool:
         return False
     if not strategy.inited:
         log(f"{name}: not inited after init_strategy (exception in on_init?)", "ERROR")
+        return False
+    if not getattr(strategy, "warmup_ok", True):
+        # on_init is @guarded: a failed load_bar halts inside on_init, but the
+        # engine then restores the persisted variables and sets inited=True
+        # regardless.  Never start on an empty ArrayManager (atr == 0).
+        log(f"{name}: warmup failed (empty indicators); not starting", "ERROR")
+        strategy.inited = False      # so the watchdog re-inits (load_bar again) instead of restarting
         return False
     cta_engine.start_strategy(name)
     if not strategy.trading:
@@ -521,6 +575,8 @@ def run_live(env: dict[str, str], exchange: str, deployment: Sequence[tuple[str,
         # OKX connects its websockets only after every instrument list arrived;
         # both gateways query open orders right after the contracts.
         time.sleep(OKX_WS_SETTLE_SECS if exchange == "okx" else 0.0)
+        if not wait_for_account(main_engine, gateway_name):
+            return EXIT_STARTUP
         time.sleep(ORDER_QUERY_SETTLE_SECS)
 
         cta_engine.init_engine()        # loads strategy classes, re-adds saved strategies, restores variables

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from sizing import LotInfo, calc_volume, ceil_to, fee_rt, floor_to, min_stop_pct, streak_mult
+from sizing import LEVERAGE_SAFETY, LotInfo, calc_volume, ceil_to, fee_rt, floor_to, min_stop_pct, streak_mult
 
 # Common worked-example inputs: balance 50, normal dial risk 2 %, leverage
 # override 5x, gross 4x with nothing open -> free_notional 200.
@@ -154,6 +154,20 @@ def test_absolute_two_x_risk_cap() -> None:
     # coarse step 0.05: v = 0 -> bump to 0.05: notional 150 > min(250, 1.5*50=75) -> 0
     coarse = LotInfo(size=1.0, step=0.05, min_notional=20.0, pricetick=0.01)
     assert calc_volume(50.0, 0.02, 3000.0, 60.0, coarse, 5.0, 200.0) == 0.0
+
+
+def test_leverage_bound_size_passes_pre_send_cap() -> None:
+    """
+    Low-ATR regime on the normal dial (max_leverage 3): the leverage leg binds
+    and the result must stay under the 0.98*balance*max_leverage cap that
+    ``risk.check_order`` applies, otherwise every such entry is skipped.
+    """
+    for stop in (5.0, 8.0, 10.0, 12.0):
+        v = calc_volume(50.0, 0.02, 3000.0, stop, ETH, 3.0, 200.0)
+        assert v > 0
+        assert v * 3000.0 <= LEVERAGE_SAFETY * 50.0 * 3.0 + 1e-9, (stop, v)
+    assert calc_volume(50.0, 0.02, 3000.0, 5.0, ETH, 3.0, 200.0) == 0.049      # 147 / 3000 floored
+    assert LEVERAGE_SAFETY == 0.98
 
 
 def test_free_notional_binds() -> None:

@@ -177,10 +177,25 @@ class SqueezeBreak15M(CtaTemplate):
     @guarded
     def on_start(self) -> None:
         self._load_contract()
-        if self.live:  # local stops / order ids die with the process
+        if self.live:
+            # Ids are stale after a process restart, but an in-process re-init
+            # (watchdog) leaves engine-local stops registered under this name:
+            # cancel whatever the engine still tracks before forgetting the ids.
+            self._cancel_engine_orders()
             self.entry_orderid = self.stop_orderid = self.exit_orderid = ""
             self._first_tick = True
+        self.guard.reapply_pending_halt()
         self.write_log(f"started pos={self.pos} stop={self.stop_price} halted={self.halted}/{self.halt_reason}")
+
+    def _cancel_engine_orders(self) -> None:
+        """Cancel every order the CTA engine still tracks for this strategy (works while trading is False)."""
+        try:
+            tracked = self.cta_engine.strategy_orderid_map.get(self.strategy_name, set())
+        except AttributeError:
+            return
+        for oid in list(tracked):
+            self.write_log(f"cancelling order {oid} left from a previous run of this strategy")
+            self.cta_engine.cancel_order(self, oid)
 
     @guarded
     def on_stop(self) -> None:
@@ -260,15 +275,34 @@ class SqueezeBreak15M(CtaTemplate):
         force = 0 < self._reconcile_due <= ts
         if force:
             self._reconcile_due = 0.0
-        res = self.guard.reconcile_live(tick.last_price, ts, force=force)
-        if res is not None and res.outcome == "adopt":
-            self._ensure_stop(tick.last_price, ts)
+        self._reconcile(tick.last_price, ts, force)
         self.guard.heartbeat(ts)
+
+    def _reconcile(self, last: float, ts: float, force: bool) -> None:
+        """
+        Reconcile with the exchange; after an adopt / clear cancel the orders
+        the guard forgot (a stale local stop would fire for the wrong size, a
+        resting exit would open a reverse position) before re-arming.
+        """
+        old_ids = (self.stop_orderid, self.entry_orderid, self.exit_orderid)
+        res = self.guard.reconcile_live(last, ts, force=force)
+        if res is None or res.outcome in ("ok", "desync"):
+            return
+        for oid in old_ids:
+            if oid and self._is_active(oid):
+                self.cancel_order(oid)
+        self.stop_orderid, self.entry_orderid, self.exit_orderid = "", "", ""
+        self._stop_vol = 0.0
+        self._exit_pending, self._exit_reason, self._exit_chase_n = False, "", 0
+        self._closing_via_stop = False
+        if res.outcome == "adopt":
+            self._ensure_stop(last, ts)
+        self.sync_data()
 
     def _on_first_tick(self, tick: TickData, ts: float) -> None:
         """Recover after (re)start: reconcile, refresh extremes, re-arm the stop."""
         self._first_tick = False
-        self.guard.reconcile_live(tick.last_price, ts, force=True)
+        self._reconcile(tick.last_price, ts, True)
         if self.pos != 0:
             self.highest_since_entry = max(self.highest_since_entry, tick.last_price)
             self.lowest_since_entry = min(self.lowest_since_entry or tick.last_price, tick.last_price)
@@ -561,8 +595,12 @@ class SqueezeBreak15M(CtaTemplate):
     def on_trade(self, trade: TradeData) -> None:
         ts = ts_of(trade.datetime) if trade.datetime else self._now_ts
         signed = trade.volume if trade.direction == Direction.LONG else -trade.volume
-        pos_before = self.pos - signed
+        step = self.min_volume or self.lot.step or 0.001
+        self.pos = round_to(self.pos, step)         # float residue after partial fills -> exact step multiple
+        pos_before = round_to(self.pos - signed, step)
         price, vol = float(trade.price), float(trade.volume)
+        if self.live:
+            self.guard.note_fill(ts)
         fee = self.fee_rate * price * vol * self.size
         self.fees_paid += fee
         self._trade_fees += fee

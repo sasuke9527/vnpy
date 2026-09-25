@@ -132,6 +132,7 @@ GATE_MIN_TRADES: int = 100
 GATE_GRID_RATIO: float = 0.70
 GATE_DROP_TOP_FRAC: float = 0.05
 GATE_ALT_SLIPPAGE: float = 0.0008
+EXIT_GATE_FAIL_ABORTED: int = 3    # replay aborted / strategy exceptions: never a usable result
 
 STAT_KEYS: tuple[str, ...] = (
     "total_net_pnl", "end_balance", "total_return", "annual_return", "max_drawdown", "max_ddpercent",
@@ -493,33 +494,46 @@ def apply_funding(engine: BacktestingEngine, df: DataFrame, funding: FundingResu
 # Trade-log analytics (expectancy in R, drop-top-5 %)
 # ---------------------------------------------------------------------------
 
-def trade_pnl_risk(row: dict[str, Any]) -> tuple[float, float]:
+def trade_pnl_risk(row: dict[str, Any], slippage: float = 0.0, size: float = 1.0) -> tuple[float, float]:
     """
     ``(net_pnl, risk_usd)`` for one ``trade_log`` row.  Supports both
     strategy conventions: S1 rows carry ``pnl`` (net) + ``risk_usd`` + ``r``
     (ratio); S2 rows carry ``pnl`` (gross), ``fees``, ``net`` and ``r`` (the
     risk in USDT).
+
+    ``slippage`` is the engine's absolute slippage per unit volume: the
+    backtester books it only in the daily result (never in fill prices), so
+    it is charged here on both legs (``2 * volume * size * slippage``) using
+    the row's ``volume`` to keep the R statistics consistent with the
+    engine's net pnl.
     """
     if "risk_usd" in row:
         pnl = float(row.get("net", row.get("pnl", 0.0)) or 0.0)
-        return pnl, float(row.get("risk_usd") or 0.0)
-    if "net" in row:
-        return float(row.get("net") or 0.0), float(row.get("r") or 0.0)
-    return float(row.get("pnl") or 0.0), float(row.get("risk_usd") or 0.0)
+        risk = float(row.get("risk_usd") or 0.0)
+    elif "net" in row:
+        pnl, risk = float(row.get("net") or 0.0), float(row.get("r") or 0.0)
+    else:
+        pnl, risk = float(row.get("pnl") or 0.0), float(row.get("risk_usd") or 0.0)
+    if slippage:
+        pnl -= 2.0 * float(row.get("volume") or 0.0) * size * slippage
+    return pnl, risk
 
 
-def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0) -> dict[str, Any]:
+def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0,
+                 slippage: float = 0.0, size: float = 1.0) -> dict[str, Any]:
     """
     Mean R per round trip (``pnl / risk_usd``).  ``funding_total`` (USDT over
     the whole run) is spread evenly over the trades and expressed in R via the
-    mean risk, giving the after-funding expectancy.
+    mean risk, giving the after-funding expectancy.  ``slippage`` / ``size``
+    charge the engine's per-unit slippage on every round trip (see
+    ``trade_pnl_risk``).
     """
     rs: list[float] = []
     risks: list[float] = []
     pnls: list[float] = []
     wins = 0
     for row in trade_log:
-        pnl, risk = trade_pnl_risk(row)
+        pnl, risk = trade_pnl_risk(row, slippage, size)
         pnls.append(pnl)
         if risk > 0:
             rs.append(pnl / risk)
@@ -536,9 +550,10 @@ def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0
                 best_r=(max(rs) if rs else 0.0), worst_r=(min(rs) if rs else 0.0))
 
 
-def drop_top_trades_pnl(trade_log: Sequence[dict[str, Any]], frac: float = GATE_DROP_TOP_FRAC) -> dict[str, Any]:
-    """Sum of trade pnl after removing the best ``ceil(frac * n)`` trades."""
-    pnls = sorted((trade_pnl_risk(row)[0] for row in trade_log), reverse=True)
+def drop_top_trades_pnl(trade_log: Sequence[dict[str, Any]], frac: float = GATE_DROP_TOP_FRAC,
+                        slippage: float = 0.0, size: float = 1.0) -> dict[str, Any]:
+    """Sum of trade pnl (net of fees and engine slippage) after removing the best ``ceil(frac * n)`` trades."""
+    pnls = sorted((trade_pnl_risk(row, slippage, size)[0] for row in trade_log), reverse=True)
     n = len(pnls)
     k = int(math.ceil(frac * n)) if n else 0
     return dict(trades=n, dropped=k, dropped_pnl=float(sum(pnls[:k])), remaining_pnl=float(sum(pnls[k:])),
@@ -556,6 +571,9 @@ def _grid_evaluate(strategy_name: str, params: EngineParams, target: str,
     stats = {k: _py(v) for k, v in run.stats.items()}
     stats["round_trips"] = len(run.trade_log)
     stats["exception_logs"] = run.exception_logs
+    stats["aborted"] = run.aborted
+    if run.aborted or run.exception_logs:
+        return setting, float("-inf"), stats      # a truncated replay must never rank
     return setting, float(stats.get(target, 0.0) or 0.0), stats
 
 
@@ -598,7 +616,7 @@ def run_grid(strategy_name: str, params: EngineParams, base_setting: dict[str, A
         results = [evaluate(cell) for cell in cells]
     results.sort(key=_target_value, reverse=True)
 
-    values = [r[1] for r in results]
+    values = [r[1] for r in results if math.isfinite(r[1])]
     best = max(values) if values else 0.0
     median = float(pystats.median(values)) if values else 0.0
     ratio = (median / best) if best > 0 else None
@@ -632,9 +650,13 @@ class GateRow:
 def acceptance_gate(strategy_name: str, stats_funded: dict[str, Any], stats_stress: dict[str, Any],
                     expectancy: dict[str, Any], drop_top: dict[str, Any], funding_total: float,
                     months: float, slippage_pct: float, grid: dict[str, Any] | None,
-                    fee_sweep: list[dict[str, Any]] | None) -> list[GateRow]:
+                    fee_sweep: list[dict[str, Any]] | None, aborted: bool = False,
+                    exception_logs: int = 0) -> list[GateRow]:
     """SPEC section 7 rules, one row each (rules needing --grid / --fees-sweep are n/a without them)."""
     rows: list[GateRow] = []
+    clean = not aborted and exception_logs == 0
+    rows.append(GateRow("replay completed without exceptions", float(exception_logs), "== 0", clean,
+                        "engine aborted the replay" if aborted else ("strategy exception logs" if not clean else "")))
     exp = float(expectancy["expectancy_r_after_funding"])
     rows.append(GateRow("expectancy per trade (R, after funding)", exp, f">= {GATE_EXPECTANCY_R}",
                         exp >= GATE_EXPECTANCY_R, f"pre-funding {expectancy['expectancy_r']:.3f} R over "
@@ -646,8 +668,11 @@ def acceptance_gate(strategy_name: str, stats_funded: dict[str, Any], stats_stre
     rows.append(GateRow("max_ddpercent (after funding)", dd, f">= {GATE_MAX_DD_PCT}", dd >= GATE_MAX_DD_PCT))
     n_trades = int(expectancy["round_trips"])
     need_months = 24 if strategy_name == "DonchianTrendH1" else 12
-    rows.append(GateRow("round trips", float(n_trades), f">= {GATE_MIN_TRADES}", n_trades >= GATE_MIN_TRADES,
-                        f"over >= {need_months} months of data; this run covers {months:.1f} months"))
+    months_ok = months >= need_months
+    rows.append(GateRow("round trips", float(n_trades), f">= {GATE_MIN_TRADES}",
+                        n_trades >= GATE_MIN_TRADES and months_ok,
+                        f"over >= {need_months} months of data; this run covers {months:.1f} months"
+                        + ("" if months_ok else f" (short by {need_months - months:.1f})")))
     remaining = float(drop_top["remaining_pnl"]) - funding_total
     rows.append(GateRow("pnl after dropping top 5 % trades (minus funding)", remaining, "> 0", remaining > 0,
                         f"dropped {drop_top['dropped']} trade(s) worth {drop_top['dropped_pnl']:.2f}"))
@@ -809,8 +834,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print_stats_table(columns)
     print(f"{'funding_total':<28}{0.0:>16.4f}{funding.total:>16.4f}{stress.total:>16.4f}")
 
-    expectancy = expectancy_r(run.trade_log, funding.total)
-    drop_top = drop_top_trades_pnl(run.trade_log)
+    expectancy = expectancy_r(run.trade_log, funding.total, params.slippage, params.size)
+    drop_top = drop_top_trades_pnl(run.trade_log, slippage=params.slippage, size=params.size)
     print(f"\nexpectancy: {expectancy['expectancy_r']:.3f} R pre-funding, "
           f"{expectancy['expectancy_r_after_funding']:.3f} R after funding; win rate "
           f"{expectancy['win_rate']:.2%}; mean risk {expectancy['mean_risk_usd']:.3f} USDT; "
@@ -860,8 +885,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # -- gate -----------------------------------------------------------------
     gate = acceptance_gate(args.strategy, stats_funded, stats_stress, expectancy, drop_top, funding.total,
-                           months, slippage_pct, grid, fee_sweep)
+                           months, slippage_pct, grid, fee_sweep, run.aborted, run.exception_logs)
     print_gate(gate)
+    if run.aborted or run.exception_logs:
+        print("ERROR: statistics above come from a truncated / exception-ridden replay; verdict forced to FAIL")
 
     # -- chart / report -------------------------------------------------------
     if args.chart:
@@ -894,6 +921,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(_py(report), indent=2, sort_keys=False), encoding="utf-8")
         print(f"report written to {out}")
+    if run.aborted or run.exception_logs:
+        return EXIT_GATE_FAIL_ABORTED
     return 0
 
 

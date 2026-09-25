@@ -87,10 +87,20 @@ class Run:
         self.bars_with_pos: int = 0
         self.stop_seen: int = 0
         self.orders_at_send: list[tuple[str, str, float, float, float]] = []   # (id, offset, price, vol, notional)
+        self._df: Any = None
 
     @property
     def logs(self) -> list[str]:
         return list(self.engine.logs) + self.output
+
+    def daily(self) -> Any:
+        """
+        The engine's daily result frame, computed ONCE: ``calculate_result``
+        re-adds every trade to the persistent ``daily_results`` on each call.
+        """
+        if self._df is None:
+            self._df = self.engine.calculate_result()
+        return self._df
 
 
 def _run(strategy_class: type[CtaTemplate], start: datetime, setting: dict[str, Any] | None = None,
@@ -128,7 +138,14 @@ def _run(strategy_class: type[CtaTemplate], start: datetime, setting: dict[str, 
         if s.pos == 0:
             return
         run.bars_with_pos += 1
-        stop_ok = bool(s.stop_orderid) and s.stop_orderid in engine.active_stop_orders
+        so = engine.active_stop_orders.get(s.stop_orderid) if s.stop_orderid else None
+        stop_ok = so is not None
+        if so is not None:
+            # the stop must cover exactly the position, on the closing side
+            want_dir = Direction.SHORT if s.pos > 0 else Direction.LONG
+            if abs(so.volume - abs(s.pos)) > 1e-9 or so.direction != want_dir or so.offset != Offset.CLOSE:
+                run.violations.append(f"{bar.datetime} pos={s.pos} stop {so.stop_orderid} volume={so.volume} "
+                                      f"direction={so.direction} offset={so.offset}")
         exit_ok = bool(s.exit_orderid) and (s.exit_orderid in engine.active_limit_orders)
         if stop_ok:
             run.stop_seen += 1
@@ -169,7 +186,7 @@ def _assert_orders(run: Run, all_orders_min_notional: bool = False) -> None:
 
 
 def _funded_stats(run: Run) -> dict[str, Any]:
-    df = run.engine.calculate_result()
+    df = run.daily()
     assert df is not None and not df.empty
     raw = run.engine.calculate_statistics(df, output=False)
     history = list(run.engine.history_data)
@@ -229,7 +246,80 @@ def test_donchian_funded_statistics(s1_run: Run) -> None:
     # every round trip in the strategy's own log carries a risk figure for the R statistics
     for row in s1_run.strategy.trade_log:
         assert row["risk_usd"] > 0
-        assert set(row) >= {"entry_ts", "exit_ts", "pnl", "r", "reason"}
+        assert set(row) >= {"entry_ts", "exit_ts", "pnl", "gross", "fees", "volume", "r", "reason"}
+        assert row["pnl"] == pytest.approx(row["gross"] - row["fees"])
+        assert row["volume"] > 0
+
+
+def _strategy_balance(run: Run) -> tuple[float, float]:
+    """(balance, equity_mtm) as risk.get_equity computes it for the finished strategy."""
+    s: Any = run.strategy
+    balance = CAPITAL + float(s.realized_pnl) - float(s.fees_paid)
+    unreal = float(s.pos) * (float(s.last_close) - float(s.entry_price)) * 1.0 if s.pos else 0.0
+    return balance, balance + unreal
+
+
+def test_donchian_balance_matches_engine_no_double_fee(s1_run: Run) -> None:
+    """capital + gross realized - fees (+ open pnl) == engine end_balance + slippage (the engine books slippage, the strategy does not)."""
+    df = s1_run.daily()
+    stats = s1_run.engine.calculate_statistics(df, output=False)
+    _balance, equity = _strategy_balance(s1_run)
+    assert equity == pytest.approx(float(stats["end_balance"]) + float(stats["total_slippage"]), abs=1e-6)
+    # fees are charged exactly once: realized_pnl is gross
+    gross_from_log = sum(r["gross"] for r in s1_run.strategy.trade_log)
+    assert float(s1_run.strategy.realized_pnl) == pytest.approx(gross_from_log, abs=1e-9)
+
+
+def test_squeeze_balance_matches_engine(synth_db: Any) -> None:
+    run = _run(SqueezeBreak15M, SYNTH_START, {"warmup_days": 5})
+    if not run.engine.get_all_trades():
+        pytest.skip("no S2 trade on seed 1")
+    df = run.daily()
+    stats = run.engine.calculate_statistics(df, output=False)
+    _balance, equity = _strategy_balance(run)
+    assert equity == pytest.approx(float(stats["end_balance"]) + float(stats["total_slippage"]), abs=1e-6)
+
+
+def test_backtest_ignores_operator_flag_files(synth_db: Any, s1_run: Run, trader_dir: Any) -> None:
+    """PAUSE / KILL / RESUME in the shared .vntrader change nothing in a backtest and survive it."""
+    start = (s1_run.engine.start - timedelta(days=WARMUP_DAYS)).replace(tzinfo=timezone.utc)
+    flags = [trader_dir / name for name in ("PAUSE", "KILL", "RESUME")]
+    for f in flags:
+        f.write_text("1", encoding="utf-8")
+    try:
+        run = _run(DonchianTrendH1, start)
+        _assert_clean(run)
+        assert len(run.engine.get_all_trades()) == len(s1_run.engine.get_all_trades())
+        assert run.strategy.halt_reason != "KILL"
+        for f in flags:
+            assert f.exists(), f"{f.name} was consumed by a backtest"
+    finally:
+        for f in flags:
+            f.unlink(missing_ok=True)
+
+
+def test_expectancy_charges_engine_slippage() -> None:
+    rows = [dict(pnl=1.0, gross=1.05, fees=0.05, volume=0.016, risk_usd=1.0, r=1.0, reason="STOP")]
+    base = bt.expectancy_r(rows)
+    slipped = bt.expectancy_r(rows, slippage=1.0, size=1.0)
+    assert base["expectancy_r"] == pytest.approx(1.0)
+    assert slipped["expectancy_r"] == pytest.approx(1.0 - 2 * 0.016)
+    assert bt.drop_top_trades_pnl(rows, slippage=1.0)["total_pnl"] == pytest.approx(1.0 - 0.032)
+
+
+def test_gate_fails_on_aborted_replay_and_short_history() -> None:
+    exp = dict(expectancy_r_after_funding=0.5, expectancy_r=0.5, sized_trades=150, round_trips=150)
+    stats = dict(sharpe_ratio=2.0, max_ddpercent=-5.0, total_net_pnl=10.0)
+    drop = dict(remaining_pnl=5.0, dropped=8, dropped_pnl=3.0)
+    rows = bt.acceptance_gate("DonchianTrendH1", stats, stats, exp, drop, 0.0, 30.0, 0.0003, None, None)
+    by_rule = {r.rule: r for r in rows}
+    assert by_rule["replay completed without exceptions"].passed is True
+    assert by_rule["round trips"].passed is True
+    rows = bt.acceptance_gate("DonchianTrendH1", stats, stats, exp, drop, 0.0, 3.0, 0.0003, None, None,
+                              aborted=True, exception_logs=0)
+    by_rule = {r.rule: r for r in rows}
+    assert by_rule["replay completed without exceptions"].passed is False
+    assert by_rule["round trips"].passed is False and "short by" in by_rule["round trips"].note
 
 
 def test_squeeze_runs_clean(synth_db: Any) -> None:

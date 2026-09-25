@@ -25,7 +25,7 @@ from vnpy.trader.utility import ArrayManager, BarGenerator, round_to
 from vnpy_ctastrategy import CtaTemplate, StopOrder
 from vnpy_ctastrategy.base import STOPORDER_PREFIX, EngineType, StopOrderStatus
 
-from risk import MAX_ORDERS_PER_MIN, RiskDecision, RiskGuard, RiskLimits, get_equity, guarded, ts_of
+from risk import RECONCILE_QUIET_SECS, RiskDecision, RiskGuard, RiskLimits, get_equity, guarded, ts_of
 from settings import DIALS, base_from_vt_symbol, contract_name_for, exchange_from_vt_symbol, lot_info_for
 from sizing import LotInfo, calc_volume, fee_rt, min_stop_pct
 
@@ -38,6 +38,10 @@ PANIC_SECS: float = 30.0
 PANIC_TRIGGER: float = 0.002
 PANIC_PCT: float = 0.003
 ENTRY_LIMIT_PCT: float = 0.001
+#: After an exit is REJECTED (reduce-only on a position that is gone, price
+#: filter, ...) wait for the forced reconcile before retrying; the
+#: protective stop is re-armed meanwhile so the position is never naked.
+EXIT_REJECT_BACKOFF_SECS: float = RECONCILE_QUIET_SECS
 
 
 class DonchianTrendH1(CtaTemplate):
@@ -160,7 +164,28 @@ class DonchianTrendH1(CtaTemplate):
         self._lots_checked: bool = False
         self._last_panic_ts: float = 0.0
         self._tick: TickData | None = None
+        self._cancel_pending: str = ""   # exit order id whose cancel was sent but not yet confirmed
+        self._exit_reject_ts: float = -1e18   # last exit REJECTED: back off before resending
+        self._reconcile_due: float = 0.0      # forced reconcile after a fill / exit reject (live)
+        self._trade_volume: float = 0.0  # volume closed in the current round trip (for slippage in R stats)
+        self.warmup_ok: bool = False     # set at the end of on_init; the runner refuses to start without it
         self.trade_log: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------ #
+    # float-safe position helpers
+    # ------------------------------------------------------------------ #
+    def _step(self) -> float:
+        return self.min_volume or self.lot.step or 0.001
+
+    def _is_flat(self, pos: float | None = None) -> bool:
+        """``pos`` (default: own) is zero within half a volume step (float residue after partial fills)."""
+        value = float(self.pos) if pos is None else float(pos)
+        return bool(abs(value) <= self._step() / 2.0)
+
+    def _order_volume(self) -> float:
+        """``abs(pos)`` rounded to the step; 0.0 when below one step (never send a zero-quantity order)."""
+        vol = round_to(abs(self.pos), self._step())
+        return vol if vol >= self._step() - 1e-12 else 0.0
 
     # ------------------------------------------------------------------ #
     # setup helpers
@@ -250,25 +275,47 @@ class DonchianTrendH1(CtaTemplate):
     @guarded
     def on_init(self) -> None:
         self.write_log("on_init")
+        self.warmup_ok = False
         self.apply_dial()
         self.guard.limits = RiskLimits.from_strategy(self, suffix="s1")
         if self.equity <= 0:
             self.equity = float(self.capital)
         self._build_generators()
         self.load_bar(int(self.warmup_days), Interval.MINUTE)   # trading is False: no orders
+        self.warmup_ok = bool(self.am.inited and self.atr > 0)
+        if not self.warmup_ok:
+            self.write_log(f"warmup incomplete: am.inited={self.am.inited} atr={self.atr}")
 
     @guarded
     def on_start(self) -> None:
         self._setup_contract()
-        if self.live:   # ids are stale after a restart; the runner cancelled orphans
+        if self.live:
+            # Ids are stale after a process restart (the runner cancelled the
+            # server orphans) but NOT after an in-process re-init by the
+            # watchdog: engine-local stops registered under this strategy
+            # name would still fire.  Cancel everything the engine tracks.
+            self._cancel_engine_orders()
             self.entry_orderid = self.stop_orderid = self.exit_orderid = ""
+            self._cancel_pending = ""
             self._first_tick = True
+        self.guard.reapply_pending_halt()   # e.g. an EXCEPTION halt raised inside on_init
         self._check_lots(self.last_close)
-        self.write_log(f"on_start pos={self.pos} equity={self.equity} halted={self.halted}/{self.halt_reason}")
+        self.write_log(f"on_start pos={self.pos} equity={self.equity} halted={self.halted}/{self.halt_reason} "
+                       f"warmup_ok={self.warmup_ok}")
+
+    def _cancel_engine_orders(self) -> None:
+        """Cancel every order the CTA engine still tracks for this strategy (works while trading is False)."""
+        try:
+            tracked = self.cta_engine.strategy_orderid_map.get(self.strategy_name, set())
+        except AttributeError:
+            return
+        for oid in list(tracked):
+            self.write_log(f"cancelling order {oid} left from a previous run of this strategy")
+            self.cta_engine.cancel_order(self, oid)
 
     @guarded
     def on_stop(self) -> None:
-        if self.pos != 0:
+        if not self._is_flat():
             self.write_log(f"on_stop with open position {self.pos}: local stop dies with the process")
         self.sync_data()
 
@@ -283,6 +330,13 @@ class DonchianTrendH1(CtaTemplate):
         if self._first_tick and self.trading:
             self._first_tick = False
             self._on_first_tick(tick, ts)
+        if self.trading:
+            # Reconcile BEFORE the 1m bar / chase logic so a position the
+            # exchange no longer holds is cleared before anything resends for it.
+            force = 0 < self._reconcile_due <= ts
+            if force:
+                self._reconcile_due = 0.0
+            self._reconcile(tick.last_price, ts, force=force)
         bar = tick.extra.get("bar") if tick.extra else None
         if self.kline_mode:
             if bar is not None and bar.datetime.isoformat() != self.last_1m_dt:
@@ -298,8 +352,7 @@ class DonchianTrendH1(CtaTemplate):
         decision = self.guard.tick(tick, equity, balance)
         if decision is not None:
             self._apply_decision(decision, tick.last_price, ts)
-        self._reconcile(tick.last_price, ts, force=False)
-        if self.pos != 0:
+        if not self._is_flat():
             if self._exit_reason:
                 self._chase_exit(ts, tick.last_price)
             else:
@@ -345,7 +398,7 @@ class DonchianTrendH1(CtaTemplate):
         if not self.trading:
             return
         ts = self._now_ts or ts_of(bar.datetime)
-        if self.pos != 0:
+        if not self._is_flat():
             self.signal_dir = 0
             self._manage_position_1h(close, ema_fast, ema_slow, atr, ts)
         else:
@@ -354,6 +407,17 @@ class DonchianTrendH1(CtaTemplate):
                 self.trigger = round_to(dc_up + self.entry_buf * atr, self.pricetick or 0.01)
             elif self.signal_dir < 0:
                 self.trigger = round_to(dc_dn - self.entry_buf * atr, self.pricetick or 0.01)
+            # BarGenerator normally closes the hour window on the :59 bar,
+            # before the 15m window of that same bar (so on_15m_bar manages
+            # the fresh trigger).  When the :59 bar is missing (kline-stream
+            # gap) the hour closes on the :00 bar instead and a stale trigger
+            # / direction would stay armed until :14: manage the entry here
+            # too, with a fresh risk decision (idempotent for the normal case).
+            if not self._exit_reason:
+                balance, equity = self._balance(close)
+                decision = self.guard.pre_bar(bar, equity, balance)
+                self._apply_decision(decision, close, ts)
+                self._manage_entry(close, ts, decision, balance)
         self.sync_data()
 
     def _manage_position_1h(self, close: float, ema_fast: float, ema_slow: float, atr: float, ts: float) -> None:
@@ -391,7 +455,7 @@ class DonchianTrendH1(CtaTemplate):
         self._apply_decision(decision, close, ts)
         if self.entry_orderid and not self.entry_orderid.startswith(STOPORDER_PREFIX):
             self._cancel_entry("chase limit unfilled at management bar")
-        if self.pos == 0 and not self._exit_reason:
+        if self._is_flat() and not self._exit_reason:
             self._manage_entry(close, ts, decision, balance)
         self.sync_data()
 
@@ -400,7 +464,7 @@ class DonchianTrendH1(CtaTemplate):
             return
         ts = ts_of(bar.datetime)
         self._check_lots(float(bar.close_price))
-        if self.pos != 0:
+        if not self._is_flat():
             self.highest_since_entry = max(self.highest_since_entry, float(bar.high_price))
             self.lowest_since_entry = min(self.lowest_since_entry or float(bar.low_price), float(bar.low_price))
             if self._exit_reason:
@@ -418,20 +482,30 @@ class DonchianTrendH1(CtaTemplate):
     def _apply_decision(self, d: RiskDecision, price: float, ts: float) -> None:
         if d.cancel_entries and self.entry_orderid:
             self._cancel_entry(d.reason)
-        if d.must_flatten and self.pos != 0:
+        if d.must_flatten and not self._is_flat():
             self._request_exit(f"RISK:{d.reason}", price, ts)
 
     def _reconcile(self, last_price: float, ts: float, force: bool) -> None:
-        old_stop, old_entry = self.stop_orderid, self.entry_orderid
+        old_stop, old_entry, old_exit = self.stop_orderid, self.entry_orderid, self.exit_orderid
+        saved_stop = self.stop_price
         res = self.guard.reconcile_live(last_price, ts, force=force)
         if res is None or res.outcome == "ok":
             return
-        for oid in (old_stop, old_entry):    # guard dropped the ids; the engine still holds the orders
+        # The guard dropped the ids; the engine still holds the orders.  A
+        # server exit left resting after a 'clear' would open a reverse
+        # position when it fills; a stale stop would fire for the wrong size.
+        for oid in (old_stop, old_entry, old_exit):
             if oid:
                 self.cancel_order(oid)
-        self.entry_orderid = ""
-        if res.outcome == "adopt" and self.pos != 0:
-            self.stop_price = self._initial_stop(self.entry_price, 1 if self.pos > 0 else -1)
+        self.entry_orderid = self.stop_orderid = self.exit_orderid = ""
+        self._cancel_pending = ""
+        if res.outcome == "adopt" and not self._is_flat():
+            direction = 1 if self.pos > 0 else -1
+            if self.atr > 0:
+                self.stop_price = self._initial_stop(self.entry_price, direction)
+            elif saved_stop > 0 and (saved_stop < self.entry_price) == (direction > 0):
+                self.stop_price = saved_stop     # no ATR yet (warmup failed): keep the persisted stop
+                self.write_log(f"adopt without ATR: keeping persisted stop {saved_stop}")
             self._ensure_stop(ts)
         elif res.outcome == "clear":
             self._exit_reason = ""
@@ -440,10 +514,10 @@ class DonchianTrendH1(CtaTemplate):
 
     def _on_first_tick(self, tick: TickData, ts: float) -> None:
         self._reconcile(float(tick.last_price), ts, force=True)
-        if self.pos != 0:
+        if not self._is_flat():
             self.highest_since_entry = max(self.highest_since_entry, float(tick.last_price))
             self.lowest_since_entry = min(self.lowest_since_entry or float(tick.last_price), float(tick.last_price))
-            if self.stop_price <= 0 and self.entry_price > 0:
+            if self.stop_price <= 0 and self.entry_price > 0 and self.atr > 0:
                 self.stop_price = self._initial_stop(self.entry_price, 1 if self.pos > 0 else -1)
             self._ensure_stop(ts)
         self.guard.check_flags()
@@ -517,12 +591,15 @@ class DonchianTrendH1(CtaTemplate):
     # ------------------------------------------------------------------ #
     # protective stop and exits
     # ------------------------------------------------------------------ #
-    def _rate_ok(self, ts: float) -> bool:
-        return self.guard.orders_last_minute(ts) < MAX_ORDERS_PER_MIN
+    # The 6 orders/min limiter (guard.check_order) applies to ENTRIES only.
+    # Protective stops and exits are never rate limited: cancelling a stop
+    # and then refusing to send its replacement would leave the position
+    # naked exactly in the fast market that caused the burst (SPEC:
+    # "protective stop always present", "never stop trying").
 
     def _ensure_stop(self, ts: float) -> None:
         """Protective stop always present: arm it whenever pos != 0 and nothing is tracking it."""
-        if self.pos == 0 or self.stop_orderid or self.exit_orderid or self._exit_reason:
+        if self._is_flat() or self.stop_orderid or self.exit_orderid or self._exit_reason:
             return
         if self.stop_price <= 0:
             if self.entry_price <= 0 or self.atr <= 0:
@@ -532,22 +609,22 @@ class DonchianTrendH1(CtaTemplate):
 
     def _arm_stop(self, ts: float) -> None:
         """(Re)send the local stop at ``stop_price`` for the whole position (cancel by id first)."""
-        if self.pos == 0 or self.stop_price <= 0 or not self.trading or self.exit_orderid:
+        if self._is_flat() or self.stop_price <= 0 or not self.trading or self.exit_orderid:
+            return
+        vol = self._order_volume()
+        if vol <= 0:
+            self.write_log(f"stop not armed: position {self.pos} is below one step")
             return
         if self.stop_orderid:
             self.cancel_order(self.stop_orderid)   # local stop: synchronous
             self.stop_orderid = ""
-        if not self._rate_ok(ts):
-            self.write_log("stop re-arm deferred: order rate limit")
-            return
-        vol = abs(self.pos)
         ids = self.sell(self.stop_price, vol, stop=True) if self.pos > 0 else self.cover(self.stop_price, vol, stop=True)
         if ids:
             self.stop_orderid = ids[0]
             self.guard.note_order_sent(ts)
 
     def _request_exit(self, reason: str, ref_price: float, ts: float, pct: float | None = None) -> None:
-        if self.pos == 0:
+        if self._is_flat():
             return
         if not self._exit_reason:
             self._chase_count = 0
@@ -557,13 +634,21 @@ class DonchianTrendH1(CtaTemplate):
 
     def _ensure_exit(self, ref_price: float, ts: float, pct: float | None = None) -> None:
         """Send the limit exit for exactly ``abs(pos)`` when none is in flight; never gives up."""
-        if self.pos == 0 or not self._exit_reason or self.exit_orderid or not self.trading:
+        if self._is_flat() or not self._exit_reason or self.exit_orderid or not self.trading:
+            return
+        vol = self._order_volume()
+        if vol <= 0:
+            self.write_log(f"exit not sent: position {self.pos} is below one step")
+            return
+        if ts - self._exit_reject_ts < EXIT_REJECT_BACKOFF_SECS:
+            # A rejected exit (position gone?) is retried after the forced
+            # reconcile, not on every tick; keep the stop up meanwhile.
+            if not self.stop_orderid:
+                self._arm_stop(ts)
             return
         if self.stop_orderid:      # never let stop + limit both fill
             self.cancel_order(self.stop_orderid)
             self.stop_orderid = ""
-        if not self._rate_ok(ts):
-            return
         n = self._chase_count
         if pct is None:
             pct = CHASE_STEP * (n + 1) if n < CHASE_MAX else CHASE_SLOW_PCT
@@ -572,22 +657,34 @@ class DonchianTrendH1(CtaTemplate):
             book = self._tick.ask_price_1 if covering else self._tick.bid_price_1
             ref_price = book or ref_price
         price = round_to(ref_price * (1 + pct) if covering else ref_price * (1 - pct), self.pricetick or 0.01)
-        vol = abs(self.pos)
         ids = self.cover(price, vol) if covering else self.sell(price, vol)
         if ids:
             self.exit_orderid = ids[0]
             self._exit_sent_ts = ts
+            self._cancel_pending = ""
             self.guard.note_order_sent(ts)
             level = "CRITICAL " if n >= CHASE_MAX else ""
             self.write_log(f"{level}exit limit #{n} {vol} @ {price} ({self._exit_reason}, {self.exit_orderid})")
 
     def _chase_exit(self, ts: float, ref_price: float) -> None:
-        """Bounded chase: re-price after CHASE_SECS (6x), then every CHASE_SLOW_SECS until flat."""
-        if self.exit_orderid and not self.exit_orderid.startswith(STOPORDER_PREFIX):
+        """
+        Bounded chase: re-price after CHASE_SECS (6x), then every CHASE_SLOW_SECS until flat.
+
+        Live cancels are asynchronous: the chase step is counted once when the
+        cancel is issued and ``_exit_sent_ts`` is reset, so the following
+        ticks (up to ~5/s on Binance) neither re-cancel nor advance the
+        counter until the cancel is confirmed (``on_order`` clears the id) or
+        another full wait period has passed (lost cancel -> re-issue).
+        """
+        oid = self.exit_orderid
+        if oid and not oid.startswith(STOPORDER_PREFIX):
             wait = CHASE_SECS if self._chase_count < CHASE_MAX else CHASE_SLOW_SECS
             if ts - self._exit_sent_ts >= wait:
-                self._chase_count += 1
-                self.cancel_order(self.exit_orderid)    # async in live: resend once on_order clears the id
+                if self._cancel_pending != oid:
+                    self._chase_count += 1
+                    self._cancel_pending = oid
+                self._exit_sent_ts = ts
+                self.cancel_order(oid)    # async in live: resend once on_order clears the id
         self._ensure_exit(ref_price, ts)
 
     def _panic_check(self, tick: TickData, ts: float) -> None:
@@ -639,9 +736,16 @@ class DonchianTrendH1(CtaTemplate):
         elif oid == self.exit_orderid:
             self.exit_orderid = ""
             if order.status == Status.REJECTED:
-                self.write_log(f"CRITICAL exit order rejected ({oid}); will retry")
+                self.write_log(f"CRITICAL exit order rejected ({oid}); reconciling, then retrying")
+                self._exit_reject_ts = self._now_ts
+                if self.live:
+                    self._reconcile_due = self._now_ts + RECONCILE_QUIET_SECS
         elif oid == self.stop_orderid:
             self.stop_orderid = ""
+        if oid == self._cancel_pending:
+            self._cancel_pending = ""
+        if self.live:
+            self.guard.note_fill(self._now_ts)
         self.sync_data()
 
     @guarded
@@ -649,21 +753,29 @@ class DonchianTrendH1(CtaTemplate):
         ts = ts_of(trade.datetime) if trade.datetime else self._now_ts
         px, vol = float(trade.price), float(trade.volume)
         signed = vol if trade.direction == Direction.LONG else -vol
-        pos_before = self.pos - signed
+        # The engine accumulates pos with binary floats (0.005 + 0.045 - 0.05
+        # = -6.9e-18): normalise to the volume step so "flat" is exact.
+        step = self._step()
+        self.pos = round_to(self.pos, step)
+        pos_before = round_to(self.pos - signed, step)
         fee = self.fee_rate * px * vol * self.size
         self.fees_paid += fee
-        if pos_before == 0 or (pos_before > 0) == (signed > 0):
+        if self.live:
+            self.guard.note_fill(ts)
+            self._reconcile_due = ts + RECONCILE_QUIET_SECS    # SPEC 4.8: reconcile after each on_trade
+        if self._is_flat(pos_before) or (pos_before > 0) == (signed > 0):
             self._on_open_fill(px, vol, pos_before, ts)
         else:
             self._on_close_fill(px, vol, pos_before, fee, ts)
         self.sync_data()
 
     def _on_open_fill(self, px: float, vol: float, pos_before: float, ts: float) -> None:
-        if pos_before == 0:
+        if self._is_flat(pos_before):
             self.entry_price = px
             self.highest_since_entry = self.lowest_since_entry = px
             self.entry_bar_ts, self.bars_in_trade, self.stop_price = ts, 0, 0.0
             self._trade_pnl = 0.0
+            self._trade_volume = 0.0
         else:   # partial fills: volume-weighted entry
             self.entry_price = (self.entry_price * abs(pos_before) + px * vol) / (abs(pos_before) + vol)
         direction = 1 if self.pos > 0 else -1
@@ -675,26 +787,53 @@ class DonchianTrendH1(CtaTemplate):
 
     def _on_close_fill(self, px: float, vol: float, pos_before: float, fee: float, ts: float) -> None:
         direction = 1 if pos_before > 0 else -1
-        pnl = (px - self.entry_price) * vol * self.size * direction - fee - self.fee_rate * self.entry_price * vol * self.size
-        self.realized_pnl += pnl
-        self._trade_pnl += pnl
-        if self.pos != 0 and (self.pos > 0) != (pos_before > 0):
-            self.write_log(f"CRITICAL position flipped on exit fill: pos={self.pos}")
-        if self.pos != 0:
+        closed = min(vol, abs(pos_before))
+        # realized_pnl is GROSS (fees live in fees_paid; risk.get_equity
+        # subtracts them once); the net figure is kept for the trade log / R.
+        gross = (px - self.entry_price) * closed * self.size * direction
+        entry_fee = self.fee_rate * self.entry_price * closed * self.size
+        exit_fee = fee * (closed / vol) if vol > 0 else fee
+        self.realized_pnl += gross
+        self._trade_pnl += gross - entry_fee - exit_fee
+        self._trade_volume += closed
+        flipped = not self._is_flat() and (self.pos > 0) != (pos_before > 0)
+        if not self._is_flat() and not flipped:
+            # Partial close: keep the trade open.  Without an exit in flight
+            # (external / manual reduction) the stop must cover the new size.
+            if not self.exit_orderid and not self._exit_reason:
+                self._arm_stop(ts)
             return
+        self._close_round_trip(px, direction, ts)
+        if flipped:
+            # An over-fill (duplicate stop, manual close larger than pos)
+            # reversed the position: treat it as an unplanned entry with its
+            # own protective stop and leave it immediately.
+            self.write_log(f"CRITICAL position flipped on exit fill: pos={self.pos}; closing it")
+            self.guard.acquire_lock(abs(self.pos) * self.size * px)
+            self._on_open_fill(px, abs(self.pos), 0.0, ts)
+            self._request_exit("UNWANTED_FLIP", px, ts)
+
+    def _close_round_trip(self, px: float, direction: int, ts: float) -> None:
+        """Book the finished round trip and reset the trade state (position is flat or flipped)."""
         self.guard.on_trade_closed(self._trade_pnl, ts)
         if self._exit_from_stop:
             self.direction_blocked = direction
             self.block_until_ts = ts + self.reentry_cooldown_bars * 3600.0
         r = self._trade_pnl / self._entry_risk_usd if self._entry_risk_usd > 0 else 0.0
+        gross = (px - self.entry_price) * self._trade_volume * self.size * direction
         self.trade_log.append(dict(entry_ts=self.entry_bar_ts, exit_ts=ts, direction=direction, entry=self.entry_price,
-                                   exit=px, pnl=self._trade_pnl, risk_usd=self._entry_risk_usd, r=r,
+                                   exit=px, pnl=self._trade_pnl, gross=gross, fees=gross - self._trade_pnl,
+                                   volume=self._trade_volume, risk_usd=self._entry_risk_usd, r=r,
                                    reason=self._exit_reason or "STOP"))
         self.write_log(f"closed {direction:+d} @ {px}: pnl {self._trade_pnl:.4f} ({r:.2f}R, {self._exit_reason or 'STOP'})")
         if self.stop_orderid:
             self.cancel_order(self.stop_orderid)
             self.stop_orderid = ""
+        if self.exit_orderid:
+            self.cancel_order(self.exit_orderid)
         self.entry_price = self.stop_price = self.highest_since_entry = self.lowest_since_entry = 0.0
         self.entry_bar_ts, self.bars_in_trade = 0.0, 0
         self._exit_reason, self._exit_from_stop, self._chase_count, self._trade_pnl = "", False, 0, 0.0
+        self._trade_volume = 0.0
+        self._cancel_pending = ""
         self.guard.release_lock()

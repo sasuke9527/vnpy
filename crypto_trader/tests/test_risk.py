@@ -204,7 +204,7 @@ def test_daily_loss_is_account_wide_via_shared_state(vntrader: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 def test_drawdown_halt_requires_resume(vntrader: Path) -> None:
-    s, g = make_guard(state_dir=vntrader)
+    s, g = make_guard(FakeStrategy(engine_type=EngineType.LIVE), state_dir=vntrader)
     g.pre_bar(bar(T0), 100.0, 100.0)
     assert s.peak_equity == 100.0
     g.pre_bar(bar(T0 + timedelta(days=1)), 120.0, 120.0)
@@ -279,7 +279,7 @@ def test_trades_per_day_limit(vntrader: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 def test_reject_counter_halts_at_three_and_resets_on_accept(vntrader: Path) -> None:
-    s, g = make_guard(state_dir=vntrader)
+    s, g = make_guard(FakeStrategy(engine_type=EngineType.LIVE), state_dir=vntrader)
     g.pre_bar(bar(T0), 50.0, 50.0)
     g.on_order(order(Status.REJECTED))
     g.on_order(order(Status.REJECTED))
@@ -304,7 +304,7 @@ def test_reject_counter_halts_at_three_and_resets_on_accept(vntrader: Path) -> N
 # --------------------------------------------------------------------------- #
 
 def test_kill_pause_resume_flags(vntrader: Path) -> None:
-    s, g = make_guard(state_dir=vntrader)
+    s, g = make_guard(FakeStrategy(engine_type=EngineType.LIVE), state_dir=vntrader)
     g.pre_bar(bar(T0), 50.0, 50.0)
 
     (vntrader / "PAUSE").write_text("")
@@ -335,12 +335,27 @@ def test_kill_pause_resume_flags(vntrader: Path) -> None:
 
 
 def test_resume_never_clears_coarse_lots(vntrader: Path) -> None:
-    s, g = make_guard(state_dir=vntrader)
+    s, g = make_guard(FakeStrategy(engine_type=EngineType.LIVE), state_dir=vntrader)
     s.halted = True
     s.halt_reason = "COARSE_LOTS"
     (vntrader / "RESUME").write_text("")
     d = g.pre_bar(bar(T0), 50.0, 50.0)
     assert not d.allow_entry and s.halted and s.halt_reason == "COARSE_LOTS"
+
+
+def test_backtest_guard_ignores_and_keeps_operator_flags(vntrader: Path) -> None:
+    """A backtest sharing the live .vntrader must neither obey nor consume KILL / PAUSE / RESUME."""
+    s, g = make_guard(state_dir=vntrader)          # BACKTESTING
+    assert not g.live
+    for flag in ("KILL", "PAUSE", "RESUME"):
+        (vntrader / flag).write_text("")
+    s.halted, s.halt_reason = True, "REJECTS"
+    d = g.pre_bar(bar(T0), 50.0, 50.0)
+    assert not d.must_flatten and d.reason == "HALTED:REJECTS"   # RESUME not applied, KILL not applied
+    assert s.halted and s.halt_reason == "REJECTS"
+    for flag in ("KILL", "PAUSE", "RESUME"):
+        assert (vntrader / flag).exists(), f"{flag} consumed by a backtest"
+    assert g.check_flags() == (False, False)
 
 
 def test_tick_is_throttled_to_five_seconds(vntrader: Path) -> None:
@@ -508,6 +523,7 @@ def test_get_equity_live_uses_wallet_and_position_pnl() -> None:
         def __init__(self, vt_symbol: str, pnl: float) -> None:
             self.vt_symbol = vt_symbol
             self.pnl = pnl
+            self.gateway_name = "BINANCE_LINEAR"
 
     class Acct:
         balance = 55.0
@@ -549,6 +565,144 @@ def test_get_equity_live_uses_wallet_and_position_pnl() -> None:
     assert balance == 48.0 and mtm == 46.5
 
 
+def test_get_equity_okx_derives_wallet_from_eq() -> None:
+    """OKX AccountData.balance is ``eq`` (already includes upl): the wallet is eq - sum(upl), never double counted."""
+    class Pos:
+        def __init__(self, vt_symbol: str, pnl: float) -> None:
+            self.vt_symbol = vt_symbol
+            self.pnl = pnl
+            self.gateway_name = "OKX"
+
+    class Acct:
+        balance = 47.0          # eq = 50 wallet - 3 upl
+
+    class Contract:
+        gateway_name = "OKX"
+
+    class MainEngine:
+        def get_contract(self, vt_symbol: str) -> Any:
+            return Contract()
+
+        def get_account(self, vt_accountid: str) -> Any:
+            assert vt_accountid == "OKX.USDT"
+            return Acct()
+
+        def get_all_positions(self) -> list[Pos]:
+            return [Pos("ETHUSDT_SWAP_OKX.GLOBAL", -3.0)]
+
+    class CtaEngine:
+        main_engine = MainEngine()
+
+    s = FakeStrategy(engine_type=EngineType.LIVE)
+    s.vt_symbol = "ETHUSDT_SWAP_OKX.GLOBAL"
+    s.cta_engine = CtaEngine()  # type: ignore[attr-defined]
+    balance, mtm = get_equity(s)
+    assert balance == pytest.approx(50.0) and mtm == pytest.approx(47.0)
+
+
+# --------------------------------------------------------------------------- #
+# reconcile_live: unknown vs flat, quiet periods
+# --------------------------------------------------------------------------- #
+
+class _LiveMain:
+    def __init__(self) -> None:
+        self.account = True
+        self.positions: list[Any] = []
+
+    def get_contract(self, vt_symbol: str) -> Any:
+        class C:
+            gateway_name = "BINANCE_LINEAR"
+        return C()
+
+    def get_account(self, vt_accountid: str) -> Any:
+        return object() if self.account else None
+
+    def get_all_positions(self) -> list[Any]:
+        return list(self.positions)
+
+
+class _Pos:
+    def __init__(self, volume: float, price: float = 3000.0) -> None:
+        self.vt_symbol = VT_SYMBOL
+        self.direction = Direction.NET
+        self.volume = volume
+        self.price = price
+        self.pnl = 0.0
+        self.gateway_name = "BINANCE_LINEAR"
+
+
+def _live_guard(vntrader: Path) -> tuple[FakeStrategy, RiskGuard, _LiveMain]:
+    s = FakeStrategy(engine_type=EngineType.LIVE)
+    main = _LiveMain()
+
+    class Cta:
+        main_engine = main
+        symbol_strategy_map = {VT_SYMBOL: [s]}
+
+    s.cta_engine = Cta()  # type: ignore[attr-defined]
+    g = RiskGuard(s, dials=DIAL, state_dir=vntrader)
+    return s, g, main
+
+
+def test_exchange_net_position_none_without_row(vntrader: Path) -> None:
+    s, g, main = _live_guard(vntrader)
+    assert risk.exchange_net_position(s) is None
+    main.positions = [_Pos(0.0)]
+    assert risk.exchange_net_position(s) == (0.0, 0.0)
+    main.positions = [_Pos(-0.02, 2990.0)]
+    assert risk.exchange_net_position(s) == (-0.02, 2990.0)
+    assert risk.account_ready(s)
+    main.account = False
+    assert not risk.account_ready(s)
+
+
+def test_reconcile_live_waits_for_account_and_confirms_missing_row(vntrader: Path) -> None:
+    s, g, main = _live_guard(vntrader)
+    s.pos, s.entry_price, s.stop_price = 0.016, 3000.0, 2940.0
+    main.account = False
+    assert g.reconcile_live(3000.0, ts=1000.0, force=True) is None
+    assert s.pos == 0.016 and any("deferred" in m for m in s.logs)
+    main.account = True
+    # first "no row" reading: pending, nothing changes
+    assert g.reconcile_live(3000.0, ts=1001.0, force=True) is None
+    assert s.pos == 0.016 and any("pending confirmation" in m for m in s.logs)
+    # too early for the confirmation
+    assert g.reconcile_live(3000.0, ts=1001.0 + risk.RECONCILE_SECS - 1, force=True) is None
+    assert s.pos == 0.016
+    res = g.reconcile_live(3000.0, ts=1001.0 + risk.RECONCILE_SECS, force=True)
+    assert res is not None and res.outcome == "clear" and s.pos == 0.0
+    # a local flat strategy with no row is simply ok
+    res = g.reconcile_live(3000.0, ts=2000.0, force=True)
+    assert res is not None and res.outcome == "ok"
+
+
+def test_reconcile_live_explicit_zero_row_clears_and_quiet_period(vntrader: Path) -> None:
+    s, g, main = _live_guard(vntrader)
+    s.pos = 0.016
+    main.positions = [_Pos(0.016)]
+    res = g.reconcile_live(3000.0, ts=1000.0, force=True)
+    assert res is not None and res.outcome == "ok"
+    main.positions = [_Pos(0.0)]
+    t1 = 1000.0 + risk.RECONCILE_SECS + 1              # past the 60 s throttle
+    g.note_fill(t1 - 1.0)                              # a fill 1 s ago -> quiet for RECONCILE_QUIET_SECS
+    assert g.reconcile_live(3000.0, ts=t1, force=False) is None, "quiet period"
+    t2 = t1 + risk.RECONCILE_QUIET_SECS
+    s.exit_orderid = "BINANCE_LINEAR.7"
+    assert g.reconcile_live(3000.0, ts=t2, force=False) is None, "server order resting"
+    s.exit_orderid = ""
+    res = g.reconcile_live(3000.0, ts=t2, force=False)
+    assert res is not None and res.outcome == "clear" and s.pos == 0.0
+
+
+def test_is_flat_tolerates_float_residue() -> None:
+    s, g = make_guard()
+    s.pos = -6.938893903907228e-18
+    assert g.is_flat()
+    s.pos = 0.001
+    assert not g.is_flat()
+    assert g._release_lock_if_flat() is False       # nothing locked
+
+
 # --------------------------------------------------------------------------- #
 # exception wrapper and dial fallback
 # --------------------------------------------------------------------------- #
@@ -566,6 +720,46 @@ def test_safe_call_halts_once_then_propagates(vntrader: Path) -> None:
         g.safe_call(boom)
     s.last_1m_dt = "2026-03-01T12:01:00"
     assert g.safe_call(boom) is None                    # new bar: swallowed again
+
+
+def test_exception_halt_auto_clears_after_a_clean_bar(vntrader: Path) -> None:
+    """SPEC 4.9: the EXCEPTION halt is 'for the current bar'; a later clean bar clears it (hard halts stay)."""
+    s, g = make_guard(state_dir=vntrader)
+    s.last_1m_dt = "2026-03-01T12:00:00"
+
+    def boom() -> None:
+        raise ValueError("x")
+
+    def fine() -> int:
+        return 1
+
+    assert g.safe_call(boom) is None
+    assert s.halted and s.halt_reason == "EXCEPTION"
+    assert g.safe_call(fine) == 1
+    assert s.halted, "same bar: still halted"
+    s.last_1m_dt = "2026-03-01T12:01:00"
+    assert g.safe_call(fine) == 1
+    assert not s.halted and s.halt_reason == ""
+    assert any("auto-cleared" in m for m in s.logs)
+    # a hard halt is never auto-cleared
+    s.halted, s.halt_reason = True, "REJECTS"
+    s.last_1m_dt = "2026-03-01T12:02:00"
+    g.safe_call(boom)                                   # sets _exc_bar_key; REJECTS is not downgraded
+    s.last_1m_dt = "2026-03-01T12:03:00"
+    g.safe_call(fine)
+    assert s.halted and s.halt_reason == "REJECTS"
+
+
+def test_halt_before_start_is_reapplied_on_start() -> None:
+    """A halt raised while trading is False (on_init) is remembered and re-applied after the variable restore."""
+    s, g = make_guard()
+    s.trading = False
+    assert g.halt("EXCEPTION")
+    assert g.pending_halt == "EXCEPTION"
+    s.halted, s.halt_reason = False, ""                 # what CtaEngine._init_strategy restores
+    assert g.reapply_pending_halt()
+    assert s.halted and s.halt_reason == "EXCEPTION" and g.pending_halt == ""
+    assert not g.reapply_pending_halt()
 
 
 def test_limits_fall_back_to_dials_without_settings() -> None:
