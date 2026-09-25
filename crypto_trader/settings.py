@@ -102,14 +102,35 @@ MIN_NOTIONAL_FALLBACK: dict[str, float] = {"ETHUSDT": 20.0, "BTCUSDT": 100.0, "_
 EXCHANGE_FILTERS_FALLBACK: dict[str, dict[str, float]] = {
     "ETHUSDT": {"tickSize": 0.01, "stepSize": 0.001, "minQty": 0.001, "minNotional": 20.0},
     "BTCUSDT": {"tickSize": 0.1, "stepSize": 0.001, "minQty": 0.001, "minNotional": 100.0},
-    "_default": {"tickSize": 0.0001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 20.0},
+    # Approximate values from memory for the researched alt perps (whole-coin lots, 5 USDT min notional).
+    # Always refresh with ``download_data.py --filters`` before live use; run_live.py does so when online.
+    "SOLUSDT": {"tickSize": 0.01, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "DOGEUSDT": {"tickSize": 0.00001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "1000PEPEUSDT": {"tickSize": 0.0000001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "1000SHIBUSDT": {"tickSize": 0.000001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "1000BONKUSDT": {"tickSize": 0.000001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "WIFUSDT": {"tickSize": 0.0001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "PENGUUSDT": {"tickSize": 0.000001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "TRUMPUSDT": {"tickSize": 0.001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
+    "_default": {"tickSize": 0.0001, "stepSize": 1.0, "minQty": 1.0, "minNotional": 5.0},
 }
 
 #: (strategy_name, class_name, vt_symbol, setting overrides).  S2 stays
 #: commented out until the section 7 acceptance gate passes.
+#: Candidate configuration from RESEARCH.md (2023-01..2026-09 real-data
+#: backtests): long-only, gated by the 1h EMA(600) (~25-day trend), on the
+#: three meme perps whose fit/validate/test periods were all (near) positive.
+#: It did NOT pass the section 7 acceptance gate (validate-period Sharpe < 1);
+#: ETHUSDT was removed because the signal lost money there in 2025-2026.
+_S1_LONG_GATED: dict[str, Any] = {
+    "risk_dial": "normal", "allow_short": False, "regime_ema_n": 600, "warmup_days": 32,
+}
 DEPLOYMENT: list[tuple[str, str, str, dict[str, Any]]] = [
-    ("s1_eth", "DonchianTrendH1", "ETHUSDT_SWAP_BINANCE.GLOBAL", {"risk_dial": "normal"}),
-    # ("s2_xrp", "SqueezeBreak15M", "XRPUSDT_SWAP_BINANCE.GLOBAL", {"risk_dial": "normal"}),  # enable only after section 7 gate passes
+    ("s1_pepe", "DonchianTrendH1", "1000PEPEUSDT_SWAP_BINANCE.GLOBAL", dict(_S1_LONG_GATED)),
+    ("s1_shib", "DonchianTrendH1", "1000SHIBUSDT_SWAP_BINANCE.GLOBAL", dict(_S1_LONG_GATED)),
+    ("s1_wif", "DonchianTrendH1", "WIFUSDT_SWAP_BINANCE.GLOBAL", dict(_S1_LONG_GATED)),
+    # ("s1_eth", "DonchianTrendH1", "ETHUSDT_SWAP_BINANCE.GLOBAL", {"risk_dial": "normal"}),  # -7% / -13% / -36% in RESEARCH.md
+    # ("s2_xrp", "SqueezeBreak15M", "XRPUSDT_SWAP_BINANCE.GLOBAL", {"risk_dial": "normal"}),  # S2 lost on every symbol/period
 ]
 
 #: Exchange keys accepted in ``CT_EXCHANGE`` and their vnpy gateway names.
