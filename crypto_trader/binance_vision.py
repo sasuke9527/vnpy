@@ -229,14 +229,15 @@ def download_klines(symbol: str, interval: str, start: str, end: str | None = No
         last_month_ok = ym
         print(f"  {symbol} {interval} {ym}: {n} bars")
 
+    # Daily fill after the last monthly file (or from ``start`` when no
+    # monthly file exists yet, e.g. when start is the current month).
     if last_month_ok is None:
-        return total
-
-    # Daily fill after the last monthly file.
-    y, m = int(last_month_ok[:4]), int(last_month_ok[5:7])
-    m += 1
-    if m > 12:
-        y, m = y + 1, 1
+        y, m = int(start[:4]), int(start[5:7])
+    else:
+        y, m = int(last_month_ok[:4]), int(last_month_ok[5:7])
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
     day = datetime(y, m, 1, tzinfo=UTC).date()
     misses = 0
     while day < today and misses < 3:
