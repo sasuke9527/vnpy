@@ -89,6 +89,7 @@ class DonchianTrendH1(CtaTemplate):
     allow_long: bool = True
     allow_short: bool = True
     signal_hours: int = 1
+    regime_ema_n: int = 0              # >0: longs only above the 1h EMA(n), shorts only below (e.g. 600 = 25 days)
 
     parameters = [
         "risk_dial", "risk_pct", "max_leverage", "gross_leverage", "daily_loss_pct", "max_dd_halt",
@@ -96,7 +97,7 @@ class DonchianTrendH1(CtaTemplate):
         "min_stop_pct", "lot_tolerance", "min_notional", "entry_window", "ema_fast_n", "ema_slow_n", "atr_n",
         "adx_n", "adx_min", "max_ext", "entry_buf", "chase_atr", "stop_mult", "trail_mult", "time_stop_bars",
         "mfe_min_atr", "max_hold_bars", "reentry_cooldown_bars", "capital", "warmup_days", "use_kline_stream",
-        "streak_deleverage", "allow_long", "allow_short", "signal_hours",
+        "streak_deleverage", "allow_long", "allow_short", "signal_hours", "regime_ema_n",
     ]
 
     # -- persisted variables (JSON scalars only) ----------------------------
@@ -215,7 +216,7 @@ class DonchianTrendH1(CtaTemplate):
 
     def _build_generators(self) -> None:
         noop = self._noop
-        self.am: ArrayManager = ArrayManager(size=150)
+        self.am: ArrayManager = ArrayManager(size=max(150, int(self.regime_ema_n) + 60))
         self.bg1: BarGenerator = BarGenerator(self.on_bar)
         self.bg_sig: BarGenerator = BarGenerator(noop, max(1, int(self.signal_hours)), self.on_hour_bar, Interval.HOUR)
         self.bg_mgmt: BarGenerator = BarGenerator(noop, 15, self.on_15m_bar, Interval.MINUTE)
@@ -395,11 +396,15 @@ class DonchianTrendH1(CtaTemplate):
         self.atr, self.ema_fast_v, self.ema_slow_v, self.adx_v = atr, ema_fast, ema_slow, adx
         ext = (close - ema_fast) / atr
         vol_ok = 0.002 <= atr / close <= 0.06
+        regime_long = regime_short = True
+        if int(self.regime_ema_n) > 0:
+            ema_reg = float(am.ema(int(self.regime_ema_n)))
+            regime_long, regime_short = close > ema_reg, close < ema_reg
         common = adx >= self.adx_min and abs(ext) <= self.max_ext and vol_ok
-        long_ok = (common and bool(self.allow_long) and ema_fast > ema_slow and ema_slow > ema_slow_prev
-                   and close > ema_slow)
-        short_ok = (common and bool(self.allow_short) and ema_fast < ema_slow and ema_slow < ema_slow_prev
-                    and close < ema_slow)
+        long_ok = (common and bool(self.allow_long) and regime_long and ema_fast > ema_slow
+                   and ema_slow > ema_slow_prev and close > ema_slow)
+        short_ok = (common and bool(self.allow_short) and regime_short and ema_fast < ema_slow
+                    and ema_slow < ema_slow_prev and close < ema_slow)
         if self.live and self.trading:   # shadow-phase comparison against backtest values
             self.write_log(f"1h {bar.datetime.isoformat()} c={close} ef={ema_fast:.2f} es={ema_slow:.2f} "
                            f"atr={atr:.2f} adx={adx:.1f} dc={dc_dn:.2f}/{dc_up:.2f} L={long_ok} S={short_ok}")
