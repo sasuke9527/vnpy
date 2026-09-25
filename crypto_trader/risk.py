@@ -30,7 +30,9 @@ from typing import Any
 
 from vnpy.trader.constant import Direction, Status
 from vnpy.trader.object import BarData, TickData
-from vnpy_ctastrategy.base import EngineType
+from vnpy_ctastrategy.base import STOPORDER_PREFIX, EngineType
+
+from sizing import LEVERAGE_SAFETY
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -50,9 +52,12 @@ MAX_ORDERS_PER_MIN = 6
 MAX_REJECTS = 3
 TICK_THROTTLE_SECS = 5.0
 RECONCILE_SECS = 60.0
+#: No (unforced) reconcile for this long after a fill / order event: the
+#: exchange position push (Binance ACCOUNT_UPDATE) arrives separately from
+#: the trade push and a snapshot taken in between would be stale.
+RECONCILE_QUIET_SECS = 10.0
 HEARTBEAT_SECS = 10.0
 MAX_PRICE_DISTANCE = 0.02
-LEVERAGE_SAFETY = 0.98
 
 #: Built-in copy of the "normal" dial, used only when ``settings.py`` is
 #: unavailable and the strategy does not carry the attribute.
@@ -422,9 +427,18 @@ def get_equity(strategy: Any, close: float = 0.0) -> tuple[float, float]:
             acct = main_engine.get_account(f"{gateway}.USDT")
             balance = acct.balance if (acct and acct.balance > 0) else fallback
             unreal = 0.0
+            unreal_all = 0.0
             for p in main_engine.get_all_positions():
+                if p.gateway_name and gateway and p.gateway_name != gateway:
+                    continue
+                unreal_all += float(p.pnl or 0.0)
                 if p.vt_symbol == strategy.vt_symbol:
                     unreal += float(p.pnl or 0.0)
+            # OKX reports ``eq`` (already mark-to-market) as AccountData.balance
+            # while Binance reports ``walletBalance``: derive the wallet for OKX
+            # so unrealized pnl is never counted twice.
+            if str(gateway).upper().startswith("OKX") and acct and acct.balance > 0:
+                balance = acct.balance - unreal_all
             equity_mtm = balance + unreal
         if balance > 0:
             strategy.equity = balance
@@ -434,17 +448,24 @@ def get_equity(strategy: Any, close: float = 0.0) -> tuple[float, float]:
         return fallback, fallback
 
 
-def exchange_net_position(strategy: Any) -> tuple[float, float]:
+def exchange_net_position(strategy: Any) -> tuple[float, float] | None:
     """
     Signed net volume and entry price of this symbol on the exchange, read from
     ``main_engine.get_all_positions()`` (LONG +, SHORT -, NET signed).
+
+    Returns ``None`` when the engine holds **no** PositionData row for the
+    symbol: Binance ``/fapi/v3/positionRisk`` only lists symbols with an open
+    position and the user stream only pushes positions that change, so an
+    absent row means "unknown or flat", never simply "flat".
     """
     net = 0.0
     price = 0.0
+    seen = False
     main_engine = strategy.cta_engine.main_engine
     for p in main_engine.get_all_positions():
         if p.vt_symbol != strategy.vt_symbol:
             continue
+        seen = True
         vol = float(p.volume or 0.0)
         if p.direction == Direction.SHORT:
             vol = -abs(vol)
@@ -453,7 +474,17 @@ def exchange_net_position(strategy: Any) -> tuple[float, float]:
         net += vol
         if vol and p.price:
             price = float(p.price)
+    if not seen:
+        return None
     return net, price
+
+
+def account_ready(strategy: Any) -> bool:
+    """True once the gateway delivered the USDT account of this symbol's gateway."""
+    main_engine = strategy.cta_engine.main_engine
+    contract = main_engine.get_contract(strategy.vt_symbol)
+    gateway = contract.gateway_name if contract else str(getattr(strategy, "gateway_name", ""))
+    return main_engine.get_account(f"{gateway}.USDT") is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -520,6 +551,10 @@ class RiskGuard:
         self._order_times: deque[float] = deque()
         self._exc_bar_key: str = ""
         self._last_decision: RiskDecision = RiskDecision()
+        self._quiet_until: float = 0.0          # no unforced reconcile before this
+        self._flat_pending_ts: float = 0.0      # first "no position row" reading awaiting confirmation
+        self._not_ready_logged: bool = False
+        self.pending_halt: str = ""             # halt raised while trading=False (sync is a no-op then)
 
     # ------------------------------------------------------------------ #
     # generic helpers
@@ -559,6 +594,24 @@ class RiskGuard:
             return float(self.strategy.get_pricetick() or 0.0)
         except Exception:  # noqa: BLE001
             return 0.0
+
+    def _step(self) -> float:
+        step = float(self._get("min_volume", 0.0) or 0.0)
+        if step <= 0:
+            lot = getattr(self.strategy, "lot", None)
+            step = float(getattr(lot, "step", 0.0) or 0.0)
+        return step
+
+    def is_flat(self, pos: float | None = None) -> bool:
+        """
+        True when ``pos`` (default: the strategy's) is zero within half a
+        volume step.  The engine accumulates ``pos`` with binary floats, so
+        partial fills can leave a residue such as ``-6.9e-18`` that must
+        count as flat.
+        """
+        if pos is None:
+            pos = float(self._get("pos", 0.0) or 0.0)
+        return abs(pos) <= self._step() / 2.0
 
     def log(self, msg: str) -> None:
         _log(self.strategy, f"[risk] {msg}")
@@ -619,7 +672,31 @@ class RiskGuard:
             self.notify(f"HALT {reason}")
             self.shared.save()
             _sync(s)
+            if not bool(getattr(s, "trading", False)):
+                # sync_data is a no-op while trading is False and CtaEngine
+                # restores the persisted (unhalted) variables after on_init:
+                # remember the halt so on_start can re-apply it.
+                self.pending_halt = reason
         return changed
+
+    def reapply_pending_halt(self) -> bool:
+        """
+        Re-apply a halt raised while ``trading`` was False (e.g. inside
+        ``on_init``), which the engine's variable restore would otherwise
+        discard.  Returns True when a halt was (re)applied.
+        """
+        reason = self.pending_halt
+        self.pending_halt = ""
+        if not reason:
+            return False
+        s = self.strategy
+        if bool(self._get("halted", False)) and str(self._get("halt_reason", "")) == reason:
+            return True
+        s.halted = True
+        s.halt_reason = reason
+        self.log(f"re-applied halt {reason} raised before start")
+        _sync(s)
+        return True
 
     def clear_halt(self, reasons: frozenset[str] | set[str] = RESUMABLE_REASONS) -> bool:
         """Clear own and shared halts whose reason is in ``reasons``."""
@@ -657,7 +734,7 @@ class RiskGuard:
         Returns ``(kill, pause)``.  RESUME clears resumable halts, then the
         RESUME file (and a KILL file, which RESUME overrides) are deleted.
         """
-        if not self.live and not self.state_dir.exists():
+        if not self.live:      # backtests never read (or consume) the live operator flags
             return False, False
         try:
             if self._flag(FLAG_RESUME).exists():
@@ -791,12 +868,13 @@ class RiskGuard:
                   unrealized_pnl: float | None) -> RiskDecision:
         """Translate the current state into a RiskDecision."""
         pos = float(self._get("pos", 0.0) or 0.0)
+        has_pos = not self.is_flat(pos)
         d = RiskDecision()
 
         if kill:
             d.allow_entry = False
             d.cancel_entries = True
-            d.must_flatten = pos != 0
+            d.must_flatten = has_pos
             d.reason = "KILL"
             return d
 
@@ -806,9 +884,9 @@ class RiskGuard:
             d.cancel_entries = True
             d.reason = f"HALTED:{self.halt_reason}"
             if reasons & FLATTEN_REASONS:
-                d.must_flatten = pos != 0
+                d.must_flatten = has_pos
             elif "DAILY_LOSS" in reasons:
-                d.must_flatten = pos != 0 and (unrealized_pnl or 0.0) < 0
+                d.must_flatten = has_pos and (unrealized_pnl or 0.0) < 0
             return d
 
         if pause:
@@ -1006,9 +1084,8 @@ class RiskGuard:
             self.shared.save()
 
     def _release_lock_if_flat(self) -> bool:
-        pos = float(self._get("pos", 0.0) or 0.0)
         entry_id = str(self._get("entry_orderid", "") or "")
-        if pos == 0 and not entry_id and (
+        if self.is_flat() and not entry_id and (
                 self.shared.locks.get(self.vt_symbol) == self.name
                 or self.name in self.shared.open_notional):
             self.release_lock()
@@ -1068,26 +1145,77 @@ class RiskGuard:
         _sync(s)
         return res
 
+    def note_fill(self, ts: float | None = None) -> None:
+        """
+        A fill / order event happened: suppress unforced reconciles for
+        ``RECONCILE_QUIET_SECS`` so the exchange position push can land.
+        """
+        if ts is None:
+            ts = self._last_ts
+        self._quiet_until = max(self._quiet_until, ts + RECONCILE_QUIET_SECS)
+
+    def _server_order_pending(self) -> bool:
+        """An entry / exit order is resting on the exchange (not an engine-local stop)."""
+        for name in ("entry_orderid", "exit_orderid"):
+            oid = str(self._get(name, "") or "")
+            if oid and not oid.startswith(STOPORDER_PREFIX):
+                return True
+        return False
+
     def reconcile_live(self, last_price: float, ts: float | None = None,
                        force: bool = False) -> ReconcileResult | None:
         """
         Live reconcile against ``main_engine`` positions, throttled to 60 s
         (``force=True`` for the first tick / after a trade).  Returns ``None``
         when skipped or when the engine could not be read.
+
+        Safety rules (a wrong reconcile is worse than a late one):
+
+        * nothing runs before the gateway delivered the USDT account (the
+          position snapshot is requested right after it);
+        * unforced runs are skipped for ``RECONCILE_QUIET_SECS`` after a fill
+          and while a server entry / exit order is resting;
+        * an absent position row (see ``exchange_net_position``) is only taken
+          as "flat" when two consecutive readings >= ``RECONCILE_SECS`` apart
+          agree; an explicit zero-volume row clears immediately.
         """
         if not self.live:
             return None
         if ts is None:
             ts = self._last_ts
         last = float(self._get("last_reconcile_ts", 0.0) or 0.0)
-        if not force and ts - last < RECONCILE_SECS:
-            return None
+        if not force:
+            if ts - last < RECONCILE_SECS or ts < self._quiet_until or self._server_order_pending():
+                return None
         try:
-            net, price = exchange_net_position(self.strategy)
+            if not account_ready(self.strategy):
+                if not self._not_ready_logged:
+                    self._not_ready_logged = True
+                    self.log("reconcile deferred: account / position data not received yet")
+                self.strategy.last_reconcile_ts = ts
+                return None
+            found = exchange_net_position(self.strategy)
             n = len(self.strategy.cta_engine.symbol_strategy_map.get(self.vt_symbol, [])) or 1
         except Exception as exc:  # noqa: BLE001
             self.log(f"reconcile skipped: {exc!r}")
             return None
+        if found is None:
+            if self.is_flat():
+                self._flat_pending_ts = 0.0
+                self.strategy.last_reconcile_ts = ts
+                return ReconcileResult("ok", float(self._get("pos", 0.0) or 0.0), reason="no row, local flat")
+            if self._flat_pending_ts <= 0 or ts - self._flat_pending_ts < RECONCILE_SECS:
+                if self._flat_pending_ts <= 0:
+                    self._flat_pending_ts = ts
+                    self.log(f"no position row for {self.vt_symbol} while local pos="
+                             f"{self._get('pos', 0.0)}; clear pending confirmation in {RECONCILE_SECS:.0f}s")
+                self.strategy.last_reconcile_ts = ts
+                return None
+            self.log("no position row confirmed twice: treating the exchange as flat")
+            net, price = 0.0, 0.0
+        else:
+            net, price = found
+        self._flat_pending_ts = 0.0
         return self.reconcile(net, price, last_price, n, ts=ts)
 
     # ------------------------------------------------------------------ #
@@ -1117,7 +1245,7 @@ class RiskGuard:
         the same bar propagates.
         """
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except Exception:
             key = str(self._get("last_1m_dt", "") or "") or f"{self._last_ts:.0f}"
             if self._exc_bar_key == key:
@@ -1127,16 +1255,30 @@ class RiskGuard:
                      f"{traceback.format_exc()}")
             self.halt("EXCEPTION")
             return None
+        if self._exc_bar_key:
+            # The halt is "for the current bar": a callback that completes
+            # cleanly on a later bar clears an EXCEPTION halt automatically
+            # (hard reasons are untouched; a second exception in the same bar
+            # still propagates above).
+            key = str(self._get("last_1m_dt", "") or "") or f"{self._last_ts:.0f}"
+            if key != self._exc_bar_key:
+                self._exc_bar_key = ""
+                if self.clear_halt({"EXCEPTION"}):
+                    self.log("EXCEPTION halt auto-cleared after a clean bar")
+        return result
 
 
 __all__ = [
     "FLATTEN_REASONS",
+    "LEVERAGE_SAFETY",
+    "RECONCILE_QUIET_SECS",
     "RESUMABLE_REASONS",
     "ReconcileResult",
     "RiskDecision",
     "RiskGuard",
     "RiskLimits",
     "SharedRiskState",
+    "account_ready",
     "day_key_of",
     "exchange_net_position",
     "get_equity",

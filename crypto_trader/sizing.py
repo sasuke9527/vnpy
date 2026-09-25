@@ -24,6 +24,11 @@ import math
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
+#: Fraction of ``balance * max_leverage`` that sizing and the pre-send check
+#: (``risk.check_order``) both use as the leverage cap, so a leverage-bound
+#: size never fails its own sanity check.
+LEVERAGE_SAFETY: float = 0.98
+
 
 # ---------------------------------------------------------------------------
 # Decimal rounding helpers
@@ -149,6 +154,7 @@ def calc_volume(
     min_stop_pct: float = 0.004,
     fee_gate_mult: float = 3.0,
     fee_rt: float = 0.0013,
+    lev_safety: float = LEVERAGE_SAFETY,
 ) -> float:
     """
     Return the order volume (exact multiple of ``lot.step``) or ``0.0``.
@@ -167,6 +173,8 @@ def calc_volume(
     min_stop_pct   configured floor on stop distance as a fraction of price
     fee_gate_mult  stop must be at least this many round trips wide
     fee_rt         round-trip cost fraction (see ``fee_rt``)
+    lev_safety     leverage cap is ``lev_safety * balance * max_leverage`` (the
+                   same factor ``risk.check_order`` applies before sending)
     """
     if balance <= 0 or price <= 0 or lot.size <= 0 or lot.step <= 0:
         return 0.0
@@ -182,7 +190,7 @@ def calc_volume(
         return 0.0
 
     n_risk = risk_usd * price / stop_dist
-    n_lev = balance * max_leverage
+    n_lev = lev_safety * balance * max_leverage
     n = min(n_risk, n_lev, free_notional)
 
     unit_value = lot.size * price
