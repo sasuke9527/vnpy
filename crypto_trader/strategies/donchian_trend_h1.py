@@ -155,6 +155,7 @@ class DonchianTrendH1(CtaTemplate):
         self._entry_risk_usd: float = 0.0
         self._trade_pnl: float = 0.0
         self._zero_size_trigger: float = 0.0
+        self._now_ts: float = 0.0      # time of the latest 1m bar / tick (window bars carry their start time)
         self._first_tick: bool = True
         self._lots_checked: bool = False
         self._last_panic_ts: float = 0.0
@@ -276,6 +277,7 @@ class DonchianTrendH1(CtaTemplate):
         if not tick.last_price:
             return
         ts = ts_of(tick.datetime)
+        self._now_ts = ts
         self.last_close = float(tick.last_price)
         self._tick = tick
         if self._first_tick and self.trading:
@@ -310,6 +312,7 @@ class DonchianTrendH1(CtaTemplate):
         """1m bar: signal generator first, then management, then the 1m protective checks."""
         self.last_close = float(bar.close_price)
         self.last_1m_dt = bar.datetime.isoformat()
+        self._now_ts = ts_of(bar.datetime)
         self.bg_sig.update_bar(bar)
         self.bg_mgmt.update_bar(bar)
         self.on_1m(bar)
@@ -336,12 +339,12 @@ class DonchianTrendH1(CtaTemplate):
         common = adx >= self.adx_min and abs(ext) <= self.max_ext and vol_ok
         long_ok = common and ema_fast > ema_slow and ema_slow > ema_slow_prev and close > ema_slow
         short_ok = common and ema_fast < ema_slow and ema_slow < ema_slow_prev and close < ema_slow
-        if self.live:
+        if self.live and self.trading:   # shadow-phase comparison against backtest values
             self.write_log(f"1h {bar.datetime.isoformat()} c={close} ef={ema_fast:.2f} es={ema_slow:.2f} "
                            f"atr={atr:.2f} adx={adx:.1f} dc={dc_dn:.2f}/{dc_up:.2f} L={long_ok} S={short_ok}")
         if not self.trading:
             return
-        ts = ts_of(bar.datetime)
+        ts = self._now_ts or ts_of(bar.datetime)
         if self.pos != 0:
             self.signal_dir = 0
             self._manage_position_1h(close, ema_fast, ema_slow, atr, ts)
@@ -381,7 +384,7 @@ class DonchianTrendH1(CtaTemplate):
     def on_15m_bar(self, bar: BarData) -> None:
         if not self.trading:
             return
-        ts = ts_of(bar.datetime)
+        ts = self._now_ts or ts_of(bar.datetime)
         close = float(bar.close_price)
         balance, equity = self._balance(close)
         decision = self.guard.pre_bar(bar, equity, balance)
@@ -619,7 +622,7 @@ class DonchianTrendH1(CtaTemplate):
                 self.exit_orderid = child
                 self._exit_from_stop = True
                 self._exit_reason = self._exit_reason or "STOP"
-                self._exit_sent_ts = ts_of(stop_order.datetime) if stop_order.datetime else 0.0
+                self._exit_sent_ts = self._now_ts
                 self._chase_count = 0
                 self.write_log(f"protective stop triggered @ {stop_order.price} -> {child}")
 
@@ -643,7 +646,7 @@ class DonchianTrendH1(CtaTemplate):
 
     @guarded
     def on_trade(self, trade: TradeData) -> None:
-        ts = ts_of(trade.datetime)
+        ts = ts_of(trade.datetime) if trade.datetime else self._now_ts
         px, vol = float(trade.price), float(trade.volume)
         signed = vol if trade.direction == Direction.LONG else -vol
         pos_before = self.pos - signed
