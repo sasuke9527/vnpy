@@ -289,13 +289,16 @@ def gateway_class(exchange: str | None = None) -> type:
     module can be loaded before the cwd/``.vntrader`` dance.
     """
     exchange = exchange or exchange_from_env()
+    cls: type
     if exchange == "binance_linear":
         from vnpy_binance import BinanceLinearGateway
-        return BinanceLinearGateway
-    if exchange == "okx":
+        cls = BinanceLinearGateway
+    elif exchange == "okx":
         from vnpy_okx import OkxGateway
-        return OkxGateway
-    raise ValueError(f"unknown exchange {exchange!r}; expected one of {EXCHANGES}")
+        cls = OkxGateway
+    else:
+        raise ValueError(f"unknown exchange {exchange!r}; expected one of {EXCHANGES}")
+    return cls
 
 
 # ---------------------------------------------------------------------------

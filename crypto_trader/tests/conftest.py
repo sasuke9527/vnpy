@@ -142,6 +142,6 @@ def synth_db(db: Any, synth_bars: list[Any]) -> Any:
         from vnpy_ctastrategy.backtesting import load_bar_data
 
         load_bar_data.cache_clear()
-    except Exception:  # noqa: BLE001 - optional dependency in some test subsets
+    except Exception:  # optional dependency in some test subsets
         pass
     return db
