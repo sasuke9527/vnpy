@@ -84,6 +84,10 @@ class SqueezeBreak15M(CtaTemplate):
     capital: float = 50.0
     warmup_days: int = 5
     use_kline_stream: bool = True
+    # -- research switches (defaults reproduce the original behaviour) -----
+    streak_deleverage: bool = True
+    allow_long: bool = True
+    allow_short: bool = True
 
     # -- persisted variables (JSON scalars only)
     equity: float = 0.0
@@ -124,6 +128,7 @@ class SqueezeBreak15M(CtaTemplate):
         "bb_n", "bb_dev", "kc_n", "kc_dev", "min_squeeze_bars", "release_valid_bars", "dc_n", "ema_reg_n",
         "atr_n", "stop_mult", "trail_start_r", "trail_mult", "target_r", "time_stop_bars", "mfe_min_r",
         "max_hold_bars", "chase_pct", "capital", "warmup_days", "use_kline_stream",
+        "streak_deleverage", "allow_long", "allow_short",
     ]
     variables = [
         "equity", "realized_pnl", "fees_paid", "entry_price", "stop_price", "highest_since_entry",
@@ -397,9 +402,9 @@ class SqueezeBreak15M(CtaTemplate):
         if self.entry_orderid or self._exit_pending or not self._setup_ok(close):
             return
         blocked = self.direction_blocked if ts < self.block_until_ts else ""
-        go_long = (close > max(self.squeeze_hi, self.dc_up) and close > self.ema_reg
+        go_long = (bool(self.allow_long) and close > max(self.squeeze_hi, self.dc_up) and close > self.ema_reg
                    and self.ema_reg >= self.ema_reg_prev and blocked != "long")
-        go_short = (close < min(self.squeeze_lo, self.dc_dn) and close < self.ema_reg
+        go_short = (bool(self.allow_short) and close < min(self.squeeze_lo, self.dc_dn) and close < self.ema_reg
                     and self.ema_reg <= self.ema_reg_prev and blocked != "short")
         if not go_long and not go_short:
             return

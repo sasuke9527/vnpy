@@ -253,16 +253,20 @@ class EngineParams:
     start: datetime
     end: datetime
     rate: float
-    slippage: float          # absolute price units per unit volume (slippage_pct * reference price)
+    slippage: float          # absolute price units per unit volume (only used in slippage_mode="abs")
     size: float
     pricetick: float
     capital: float
     annual_days: int = ANNUAL_DAYS
+    slippage_pct: float = 0.0        # fraction of price per leg (slippage_mode="pct")
+    slippage_mode: str = "pct"       # "pct": folded into engine.rate; "abs": engine.slippage from ref price
 
     def apply(self, engine: BacktestingEngine) -> bool:
         """Call ``set_parameters``; returns whether ``annual_days`` was accepted by this vnpy version."""
+        rate = self.rate + (self.slippage_pct if self.slippage_mode == "pct" else 0.0)
+        slippage = 0.0 if self.slippage_mode == "pct" else self.slippage
         kwargs: dict[str, Any] = dict(vt_symbol=self.vt_symbol, interval=Interval.MINUTE, start=self.start,
-                                      end=self.end, rate=self.rate, slippage=self.slippage, size=self.size,
+                                      end=self.end, rate=rate, slippage=slippage, size=self.size,
                                       pricetick=self.pricetick, capital=self.capital)
         supported = "annual_days" in inspect.signature(engine.set_parameters).parameters
         if supported:
@@ -311,6 +315,8 @@ def run_backtest(strategy_name: str, params: EngineParams, setting: dict[str, An
     later passes reuse the identical absolute slippage.
     """
     cls = load_strategy_class(strategy_name)
+    if slippage_pct is not None:
+        params.slippage_pct = float(slippage_pct)
     engine = BacktestingEngine()
     captured: list[str] = []
 
@@ -329,7 +335,7 @@ def run_backtest(strategy_name: str, params: EngineParams, setting: dict[str, An
                          f"{params.end:%Y-%m-%d} in {WORK_TRADER_DIR / 'database.db'}; run download_data.py "
                          f"or synth_data.py first")
     ref = reference_price(history)
-    if slippage_pct is not None:
+    if slippage_pct is not None and params.slippage_mode == "abs":
         params.slippage = float(slippage_pct) * ref
         engine.slippage = params.slippage
     engine.run_backtesting()
@@ -494,7 +500,8 @@ def apply_funding(engine: BacktestingEngine, df: DataFrame, funding: FundingResu
 # Trade-log analytics (expectancy in R, drop-top-5 %)
 # ---------------------------------------------------------------------------
 
-def trade_pnl_risk(row: dict[str, Any], slippage: float = 0.0, size: float = 1.0) -> tuple[float, float]:
+def trade_pnl_risk(row: dict[str, Any], slippage: float = 0.0, size: float = 1.0,
+                   slippage_pct: float = 0.0) -> tuple[float, float]:
     """
     ``(net_pnl, risk_usd)`` for one ``trade_log`` row.  Supports both
     strategy conventions: S1 rows carry ``pnl`` (net) + ``risk_usd`` + ``r``
@@ -516,11 +523,16 @@ def trade_pnl_risk(row: dict[str, Any], slippage: float = 0.0, size: float = 1.0
         pnl, risk = float(row.get("pnl") or 0.0), float(row.get("risk_usd") or 0.0)
     if slippage:
         pnl -= 2.0 * float(row.get("volume") or 0.0) * size * slippage
+    if slippage_pct:
+        vol = float(row.get("volume") or 0.0) * size
+        entry = float(row.get("entry") or 0.0)
+        exit_ = float(row.get("exit") or entry)
+        pnl -= vol * (entry + exit_) * slippage_pct
     return pnl, risk
 
 
 def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0,
-                 slippage: float = 0.0, size: float = 1.0) -> dict[str, Any]:
+                 slippage: float = 0.0, size: float = 1.0, slippage_pct: float = 0.0) -> dict[str, Any]:
     """
     Mean R per round trip (``pnl / risk_usd``).  ``funding_total`` (USDT over
     the whole run) is spread evenly over the trades and expressed in R via the
@@ -533,7 +545,7 @@ def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0
     pnls: list[float] = []
     wins = 0
     for row in trade_log:
-        pnl, risk = trade_pnl_risk(row, slippage, size)
+        pnl, risk = trade_pnl_risk(row, slippage, size, slippage_pct)
         pnls.append(pnl)
         if risk > 0:
             rs.append(pnl / risk)
@@ -551,9 +563,9 @@ def expectancy_r(trade_log: Sequence[dict[str, Any]], funding_total: float = 0.0
 
 
 def drop_top_trades_pnl(trade_log: Sequence[dict[str, Any]], frac: float = GATE_DROP_TOP_FRAC,
-                        slippage: float = 0.0, size: float = 1.0) -> dict[str, Any]:
-    """Sum of trade pnl (net of fees and engine slippage) after removing the best ``ceil(frac * n)`` trades."""
-    pnls = sorted((trade_pnl_risk(row, slippage, size)[0] for row in trade_log), reverse=True)
+                        slippage: float = 0.0, size: float = 1.0, slippage_pct: float = 0.0) -> dict[str, Any]:
+    """Sum of trade pnl (net of fees and slippage) after removing the best ``ceil(frac * n)`` trades."""
+    pnls = sorted((trade_pnl_risk(row, slippage, size, slippage_pct)[0] for row in trade_log), reverse=True)
     n = len(pnls)
     k = int(math.ceil(frac * n)) if n else 0
     return dict(trades=n, dropped=k, dropped_pnl=float(sum(pnls[:k])), remaining_pnl=float(sum(pnls[k:])),
@@ -749,6 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dial", default="normal", choices=[*sorted(settings.DIALS), "custom"],
                    help="risk dial; 'custom' keeps the risk keys you pass with --set")
     p.add_argument("--rate", type=float, default=settings.FEES["taker"], help="taker fee rate (also the strategy's fee_rate)")
+    p.add_argument("--slippage-mode", choices=("pct", "abs"), default="pct",
+                   help="pct (default): slippage_pct is added to the engine fee rate per leg; "
+                        "abs: legacy absolute slippage = slippage_pct * mean close of the window")
     p.add_argument("--slippage-pct", type=float, default=None,
                    help="slippage as a fraction of price (default: settings.FEES table for the base symbol)")
     p.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
@@ -789,14 +804,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                                "slippage_pct": slippage_pct}
     setting.update(overrides)
     params = EngineParams(vt_symbol=args.symbol, start=start, end=end, rate=float(args.rate), slippage=0.0,
-                          size=float(specs["size"]), pricetick=float(specs["pricetick"]), capital=float(args.capital))
+                          size=float(specs["size"]), pricetick=float(specs["pricetick"]), capital=float(args.capital),
+                          slippage_pct=slippage_pct, slippage_mode=args.slippage_mode)
 
     load_bar_data.cache_clear()
     print(f"== crypto_trader backtest: {args.strategy} on {args.symbol} {start:%Y-%m-%d}..{end:%Y-%m-%d} "
           f"({months:.1f} months) ==")
     print(f"trader dir: {WORK_TRADER_DIR}  filters: {specs['filters_source']}")
     run = run_backtest(args.strategy, params, setting, slippage_pct=slippage_pct, quiet=not args.verbose)
-    print(f"engine: interval=1m rate={params.rate} slippage={params.slippage:.4f} ({slippage_pct}*{run.ref_price:.2f}) "
+    print(f"engine: interval=1m rate={params.rate} slippage_mode={params.slippage_mode} "
+          f"slippage={'rate+' + str(slippage_pct) if params.slippage_mode == 'pct' else f'{params.slippage:.4f} ({slippage_pct}*{run.ref_price:.2f})'} "
           f"size={params.size} pricetick={params.pricetick} capital={params.capital} "
           f"annual_days={params.annual_days if run.annual_days_ok else 'unsupported'} "
           f"min_notional={specs['min_notional']} step={specs['step']}")
@@ -834,8 +851,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print_stats_table(columns)
     print(f"{'funding_total':<28}{0.0:>16.4f}{funding.total:>16.4f}{stress.total:>16.4f}")
 
-    expectancy = expectancy_r(run.trade_log, funding.total, params.slippage, params.size)
-    drop_top = drop_top_trades_pnl(run.trade_log, slippage=params.slippage, size=params.size)
+    expectancy = expectancy_r(run.trade_log, funding.total, params.slippage, params.size, params.slippage_pct)
+    drop_top = drop_top_trades_pnl(run.trade_log, slippage=params.slippage, size=params.size,
+                                   slippage_pct=params.slippage_pct)
     print(f"\nexpectancy: {expectancy['expectancy_r']:.3f} R pre-funding, "
           f"{expectancy['expectancy_r_after_funding']:.3f} R after funding; win rate "
           f"{expectancy['win_rate']:.2%}; mean risk {expectancy['mean_risk_usd']:.3f} USDT; "

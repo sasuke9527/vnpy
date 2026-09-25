@@ -925,6 +925,8 @@ class RiskGuard:
     # ------------------------------------------------------------------ #
     def streak_mult(self) -> float:
         """Size multiplier ``0.5^(max(n-2,0))`` floored at 0.25."""
+        if not getattr(self.strategy, "streak_deleverage", True):
+            return 1.0
         n = int(self._get("consec_losses", 0) or 0)
         return max(0.25, 0.5 ** max(n - 2, 0))
 
