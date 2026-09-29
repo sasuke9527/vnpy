@@ -1,0 +1,8 @@
+# runtime state and generated secrets: never commit
+*.db
+*.db-wal
+*.db-shm
+*.pepper
+*.key
+__pycache__/
+.pytest_cache/
