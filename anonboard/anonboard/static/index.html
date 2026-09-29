@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>匿名板</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c1e21; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --danger:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111315; --card:#1b1e22; --ink:#e7e9ec; --muted:#9aa3ad; --line:#2a2f36; --accent:#60a5fa; --danger:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font: 15px/1.55 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+  header { position:sticky; top:0; background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:17px; margin:0; flex:1; }
+  header button { background:none; border:1px solid var(--line); color:var(--ink); border-radius:8px; padding:6px 10px; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:12px; }
+  .card.click { cursor:pointer; }
+  .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .avatar { width:22px; height:22px; border-radius:50%; display:inline-block; }
+  .badge { font-size:11px; padding:1px 6px; border-radius:6px; border:1px solid var(--line); color:var(--muted); }
+  .badge.op { color:var(--accent); border-color:var(--accent); }
+  .badge.me { color:#059669; border-color:#059669; }
+  .badge.warn { color:var(--danger); border-color:var(--danger); }
+  .body { white-space:pre-wrap; word-break:break-word; }
+  textarea, input { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+  textarea { min-height:80px; resize:vertical; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .row .grow { flex:1; }
+  button.primary { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:8px 14px; font:inherit; }
+  button.link { background:none; border:none; color:var(--muted); font-size:12px; padding:2px 4px; cursor:pointer; }
+  button.link:hover { color:var(--ink); }
+  .notice { background:#fef3c7; color:#78350f; border-radius:8px; padding:10px 12px; font-size:13px; margin-bottom:12px; }
+  @media (prefers-color-scheme: dark) { .notice { background:#3b2f0b; color:#fde68a; } }
+  .error { color:var(--danger); font-size:13px; margin-top:6px; min-height:1em; }
+  .comment { border-top:1px solid var(--line); padding:10px 0; }
+  .reply { margin-left:24px; }
+  footer { color:var(--muted); font-size:12px; text-align:center; padding:24px 0; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">匿名板</h1>
+  <button id="back" class="hidden">← 返回</button>
+</header>
+<main>
+  <div id="notice" class="notice hidden"></div>
+  <section id="phone" class="card hidden">
+    <strong>发言前需绑定手机号</strong>
+    <p class="meta">根据所在地区法规，发帖前需在后台绑定手机号。手机号只用于合规留存，不会展示给任何用户，也不会出现在帖子里。</p>
+    <div class="row"><input id="phoneInput" class="grow" placeholder="手机号" inputmode="tel"><button id="phoneSend" class="primary">发送验证码</button></div>
+    <div class="row"><input id="codeInput" class="grow" placeholder="6 位验证码" inputmode="numeric"><button id="phoneVerify" class="primary">绑定</button></div>
+    <div id="phoneError" class="error"></div>
+  </section>
+
+  <section id="feed">
+    <div class="card">
+      <textarea id="newBody" placeholder="说点什么……（无需注册；你在每个帖子里会有不同的昵称）"></textarea>
+      <div class="row"><span class="meta grow" id="newHint"></span><button id="newPost" class="primary">发布</button></div>
+      <div id="newError" class="error"></div>
+    </div>
+    <div id="threads"></div>
+    <div class="row"><button id="more" class="link hidden">加载更多</button></div>
+  </section>
+
+  <section id="thread" class="hidden">
+    <div id="threadCard" class="card"></div>
+    <div class="card">
+      <div class="meta">你在本帖将显示为：<span id="myAlias"></span></div>
+      <textarea id="commentBody" placeholder="回复……"></textarea>
+      <div class="row"><span class="meta grow" id="replyHint"></span><button id="commentPost" class="primary">回复</button></div>
+      <div id="commentError" class="error"></div>
+    </div>
+    <div id="comments" class="card"></div>
+  </section>
+</main>
+<footer id="footer"></footer>
+
+<script>
+(() => {
+  const KEY_STORE = 'anonboard.device.v1';
+  const $ = (id) => document.getElementById(id);
+  const enc = new TextEncoder();
+  let privateKey = null, pubRaw = null, config = null, me = null;
+  let currentThread = null, replyTo = null, nextBefore = null;
+
+  const b64u = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(s.length + (4 - s.length % 4) % 4, '=')), c => c.charCodeAt(0));
+  const hex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  const esc = (s) => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmtTime = (ts) => new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
+
+  // ---- identity: one P-256 key pair per install, private key never leaves the device
+  async function loadKey() {
+    const alg = { name: 'ECDSA', namedCurve: 'P-256' };
+    let stored = null;
+    try { stored = JSON.parse(localStorage.getItem(KEY_STORE) || 'null'); } catch (e) {}
+    if (stored) {
+      privateKey = await crypto.subtle.importKey('jwk', stored.priv, alg, true, ['sign']);
+      pubRaw = fromB64u(stored.pub);
+    } else {
+      const kp = await crypto.subtle.generateKey(alg, true, ['sign', 'verify']);
+      const priv = await crypto.subtle.exportKey('jwk', kp.privateKey);
+      pubRaw = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+      try { localStorage.setItem(KEY_STORE, JSON.stringify({ priv, pub: b64u(pubRaw) })); } catch (e) {}
+      privateKey = kp.privateKey;
+    }
+  }
+
+  async function signedFetch(method, path, body) {
+    const raw = body === undefined ? '' : JSON.stringify(body);
+    const bodyHash = hex(await crypto.subtle.digest('SHA-256', enc.encode(raw)));
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = b64u(crypto.getRandomValues(new Uint8Array(16)));
+    const msg = enc.encode([ts, nonce, method.toUpperCase(), path, bodyHash].join('\n'));
+    const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, msg);
+    const headers = {
+      'X-Device-Key': b64u(pubRaw), 'X-Device-Ts': String(ts), 'X-Device-Nonce': nonce, 'X-Device-Sig': b64u(sig),
+    };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const res = await fetch(path, { method, headers, body: body === undefined ? undefined : raw });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw Object.assign(new Error(data.message || res.statusText), { data, status: res.status });
+    return data;
+  }
+
+  async function register() {
+    me = await signedFetch('POST', '/v1/devices', { public_key: b64u(pubRaw), terms_version: config.terms_version });
+    renderIdentity();
+  }
+
+  function renderIdentity() {
+    $('phone').classList.toggle('hidden', !(config.requires_phone && !me.phone_bound));
+    let hint = config.requires_phone ? (me.phone_bound ? '已绑定手机号（后台留存，前台匿名）' : '发言前需绑定手机号') : '无需注册，仅设备密钥';
+    if (me.banned_until) hint = '你的发言权限已被限制至 ' + fmtTime(me.banned_until);
+    $('newHint').textContent = hint;
+  }
+
+  // ---- rendering
+  function aliasHtml(alias, isMe) {
+    if (!alias) return '<span class="meta">匿名</span>';
+    return `<span class="avatar" style="background:hsl(${alias.hue} 65% 55%)"></span><span>${esc(alias.name)}</span>` +
+      (alias.is_op ? '<span class="badge op">楼主</span>' : '') + (isMe ? '<span class="badge me">我</span>' : '');
+  }
+  function statusBadge(status) {
+    return { held: '<span class="badge warn">审核中，仅自己可见</span>', hidden: '<span class="badge warn">已被隐藏，仅自己可见</span>', shadow: '' }[status] || '';
+  }
+
+  async function loadFeed(append) {
+    const path = '/v1/threads?limit=20' + (append && nextBefore ? '&before=' + nextBefore : '');
+    const data = await signedFetch('GET', path);
+    if (!append) $('threads').innerHTML = '';
+    for (const t of data.threads) {
+      const el = document.createElement('div');
+      el.className = 'card click';
+      el.innerHTML = `<div class="meta">${aliasHtml(t.alias, t.is_me)}<span>· ${fmtTime(t.created_at)}</span><span>· ${t.comment_count} 条回复</span>${statusBadge(t.status)}</div><div class="body">${esc(t.body)}</div>`;
+      el.onclick = () => openThread(t.thread_id);
+      $('threads').appendChild(el);
+    }
+    nextBefore = data.next_before;
+    $('more').classList.toggle('hidden', !nextBefore);
+  }
+
+  async function openThread(id) {
+    currentThread = id; replyTo = null; $('replyHint').textContent = '';
+    history.replaceState(null, '', '#' + id);
+    const data = await signedFetch('GET', '/v1/threads/' + id);
+    const t = data.thread;
+    $('threadCard').innerHTML = `<div class="meta">${aliasHtml(t.alias, t.is_me)}<span>· ${fmtTime(t.created_at)}</span>${statusBadge(t.status)}</div><div class="body">${esc(t.body)}</div>` +
+      `<div class="row">${t.is_me ? `<button class="link" data-del-thread>删除</button>` : `<button class="link" data-report="thread:${t.thread_id}">举报</button><button class="link" data-block="*">不看此帖</button>`}</div>`;
+    $('myAlias').innerHTML = aliasHtml(data.my_alias, false) + (data.my_alias && data.my_alias.provisional ? '<span class="badge">若重名会自动微调</span>' : '');
+    const box = $('comments');
+    box.innerHTML = data.comments.length ? '' : '<div class="meta">还没有回复</div>';
+    for (const c of data.comments) {
+      const el = document.createElement('div');
+      el.className = 'comment' + (c.reply_to ? ' reply' : '');
+      el.innerHTML = `<div class="meta">${aliasHtml(c.alias, c.is_me)}<span>· ${fmtTime(c.created_at)}</span>${statusBadge(c.status)}</div><div class="body">${esc(c.body)}</div>` +
+        `<div class="row"><button class="link" data-reply="${c.comment_id}" data-name="${esc(c.alias.name)}">回复</button>` +
+        (c.is_me ? `<button class="link" data-del-comment="${c.comment_id}">删除</button>` : `<button class="link" data-report="comment:${c.comment_id}">举报</button><button class="link" data-block="${c.alias.alias_id}">屏蔽此人（仅本帖）</button>`) + '</div>';
+      box.appendChild(el);
+    }
+    show('thread');
+  }
+
+  function show(view) {
+    $('feed').classList.toggle('hidden', view !== 'feed');
+    $('thread').classList.toggle('hidden', view !== 'thread');
+    $('back').classList.toggle('hidden', view === 'feed');
+    $('title').textContent = view === 'feed' ? '匿名板' : '帖子';
+    if (view === 'feed') { history.replaceState(null, '', '#'); currentThread = null; }
+  }
+
+  function showError(id, err) {
+    let msg = err.message || String(err);
+    if (err.data && err.data.error === 'rate_limited') msg = '操作过于频繁，请稍后再试';
+    if (err.data && err.data.error === 'content_rejected') msg = '内容疑似包含他人隐私（手机号、证件号等）或违规信息，无法发布';
+    if (err.data && err.data.error === 'phone_required') { msg = '请先绑定手机号'; $('phone').classList.remove('hidden'); }
+    $(id).textContent = msg;
+  }
+
+  // ---- events
+  $('newPost').onclick = async () => {
+    $('newError').textContent = '';
+    try {
+      const data = await signedFetch('POST', '/v1/threads', { body: $('newBody').value });
+      $('newBody').value = '';
+      await loadFeed(false);
+      if (data.thread.status === 'held') $('newError').textContent = '内容已提交，命中审核规则，审核通过前仅自己可见';
+    } catch (e) { showError('newError', e); }
+  };
+  $('commentPost').onclick = async () => {
+    $('commentError').textContent = '';
+    try {
+      const data = await signedFetch('POST', `/v1/threads/${currentThread}/comments`, { body: $('commentBody').value, reply_to: replyTo });
+      $('commentBody').value = '';
+      await openThread(currentThread);
+      if (data.status === 'held') $('commentError').textContent = '回复已提交，命中审核规则，审核通过前仅自己可见';
+    } catch (e) { showError('commentError', e); }
+  };
+  $('more').onclick = () => loadFeed(true).catch(e => showError('newError', e));
+  $('back').onclick = () => { show('feed'); loadFeed(false).catch(e => showError('newError', e)); };
+  document.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('button'); if (!b) return;
+    try {
+      if (b.dataset.reply) { replyTo = b.dataset.reply; $('replyHint').textContent = '回复 ' + b.dataset.name; $('commentBody').focus(); }
+      else if (b.dataset.report) {
+        const [kind, id] = b.dataset.report.split(':');
+        const reason = prompt('举报原因（骚扰 / 隐私泄露 / 诽谤 / 违法信息 / 其他）');
+        if (reason === null) return;
+        const r = await signedFetch('POST', '/v1/reports', { target_type: kind, target_id: id, reason });
+        alert(r.auto_hidden ? '已举报，内容已被暂时隐藏并进入人工审核' : '已举报，我们会在 24 小时内处理');
+      }
+      else if (b.dataset.block) {
+        await signedFetch('POST', `/v1/threads/${currentThread}/blocks`, { alias_id: b.dataset.block });
+        if (b.dataset.block === '*') { show('feed'); await loadFeed(false); } else await openThread(currentThread);
+      }
+      else if (b.dataset.delComment) { if (confirm('删除这条回复？')) { await signedFetch('DELETE', `/v1/threads/${currentThread}/comments/${b.dataset.delComment}`); await openThread(currentThread); } }
+      else if ('delThread' in b.dataset) { if (confirm('删除这个帖子？')) { await signedFetch('DELETE', `/v1/threads/${currentThread}`); show('feed'); await loadFeed(false); } }
+    } catch (e) { alert(e.message); }
+  });
+  $('phoneSend').onclick = async () => {
+    $('phoneError').textContent = '';
+    try { await signedFetch('POST', '/v1/me/phone/start', { phone: $('phoneInput').value }); $('phoneError').textContent = '验证码已发送'; }
+    catch (e) { showError('phoneError', e); }
+  };
+  $('phoneVerify').onclick = async () => {
+    $('phoneError').textContent = '';
+    try { me = await signedFetch('POST', '/v1/me/phone/verify', { code: $('codeInput').value }); renderIdentity(); }
+    catch (e) { showError('phoneError', e); }
+  };
+
+  // ---- boot
+  (async () => {
+    try {
+      config = await (await fetch('/v1/config')).json();
+      $('footer').textContent = `举报与申诉：${config.contact_email} · 社区规范 ${config.terms_version} · 禁止发布他人隐私、针对具体个人或公司的指控与谣言`;
+      await loadKey();
+      await register();
+      const id = location.hash.slice(1);
+      if (id) await openThread(id); else await loadFeed(false);
+    } catch (e) {
+      $('notice').textContent = '初始化失败：' + (e.message || e) + (window.isSecureContext ? '' : '（需要 HTTPS 或 localhost 才能使用 WebCrypto）');
+      $('notice').classList.remove('hidden');
+    }
+  })();
+})();
+</script>
+</body>
+</html>
