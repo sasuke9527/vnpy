@@ -1,6 +1,7 @@
 """Business logic. The HTTP layer (app.py) is a thin adapter over `Board`."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -70,6 +71,27 @@ def public_ts(ts: float) -> int:
     """Timestamps are coarsened to the minute in public responses so that a
     reader cannot correlate a person's activity across threads by the second."""
     return int(ts // 60) * 60
+
+
+def public_status(status: str) -> str:
+    """A shadow-banned author must see their own content as normal."""
+    return VISIBLE if status == SHADOW else status
+
+
+def encode_cursor(rowid: int) -> str:
+    return base64.urlsafe_b64encode(f"r{rowid}".encode()).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> int | None:
+    if not cursor:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+        if not raw.startswith("r"):
+            raise ValueError
+        return int(raw[1:])
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BoardError(400, "bad_cursor", "分页游标无效") from exc
 
 
 class Board:
@@ -267,30 +289,34 @@ class Board:
             "thread_id": row["thread_id"],
             "body": row["body"],
             "created_at": public_ts(row["created_at"]),
-            "status": row["status"],
+            "status": public_status(row["status"]),
             "comment_count": row["comment_count"],
             "alias": self._alias_public(op) if op else None,
             "is_me": viewer_id is not None and row["device_id"] == viewer_id,
         }
 
-    def list_threads(self, viewer: Viewer, before: float | None = None, limit: int = 20) -> dict:
+    def list_threads(self, viewer: Viewer, cursor: str | None = None, limit: int = 20) -> dict:
+        """Newest first. The cursor is opaque and based on insertion order, so
+        it never reveals a thread's exact creation time (public timestamps are
+        coarsened to the minute on purpose)."""
         limit = max(1, min(limit, 50))
+        before_rowid = decode_cursor(cursor)
         params: list[Any] = [VISIBLE]
-        sql = "SELECT * FROM threads WHERE status=?"
+        sql = "SELECT rowid AS rid, * FROM threads WHERE status=?"
         if viewer.device_id:
-            sql = "SELECT * FROM threads WHERE (status=? OR (device_id=? AND status IN ('held','shadow','hidden')))"
+            sql = "SELECT rowid AS rid, * FROM threads WHERE (status=? OR (device_id=? AND status IN ('held','shadow','hidden')))"
             params.append(viewer.device_id)
             sql += " AND thread_id NOT IN (SELECT thread_id FROM blocks WHERE device_id=? AND alias_id='*')"
             params.append(viewer.device_id)
-        if before is not None:
-            sql += " AND created_at<?"
-            params.append(before)
-        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        if before_rowid is not None:
+            sql += " AND rowid<?"
+            params.append(before_rowid)
+        sql += " ORDER BY rowid DESC LIMIT ?"
         params.append(limit + 1)
         rows = self.db.query(sql, params)
         items = [self._thread_public(r, viewer.device_id) for r in rows[:limit]]
-        next_cursor = rows[limit - 1]["created_at"] if len(rows) > limit else None
-        return {"threads": items, "next_before": next_cursor}
+        next_cursor = encode_cursor(rows[limit - 1]["rid"]) if len(rows) > limit else None
+        return {"threads": items, "next_cursor": next_cursor}
 
     def get_thread(self, thread_id: str, viewer: Viewer) -> dict:
         t = self.db.one("SELECT * FROM threads WHERE thread_id=?", (thread_id,))
@@ -307,7 +333,7 @@ class Board:
                 "body": c["body"],
                 "created_at": public_ts(c["created_at"]),
                 "reply_to": c["reply_to"],
-                "status": c["status"],
+                "status": public_status(c["status"]),
                 "alias": self._alias_public(a),
                 "is_me": viewer.device_id is not None and c["device_id"] == viewer.device_id,
             })
@@ -345,7 +371,7 @@ class Board:
             "comment_id": comment_id,
             "thread_id": thread_id,
             "body": body,
-            "status": status,
+            "status": public_status(status),
             "created_at": public_ts(now()),
             "reply_to": reply_to,
             "alias": {"alias_id": alias["alias_id"], "name": alias["name"], "hue": alias["hue"], "is_op": bool(alias["is_op"])},
@@ -374,45 +400,60 @@ class Board:
 
     # --------------------------------------------------------- report/block
     def report(self, device_id: str, ip: str, kind: str, target_id: str, reason: str) -> dict:
-        self._writer(device_id, ip)
+        """Auto-hide is a vote, so it must not be winnable with free identities:
+        only reports from devices older than new_device_hours count, and the
+        counting reporters must come from `threshold` distinct IPs (and, in the
+        cn profile, distinct phone numbers). Every report still reaches the
+        moderation queue."""
+        d, _ = self._writer(device_id, ip)
         table, key = self._table(kind)
         row = self.db.one(f"SELECT * FROM {table} WHERE {key}=?", (target_id,))
-        if row is None or row["status"] == DELETED:
+        if row is None or not self._visible(row, device_id):
             raise BoardError(404, "not_found", "内容不存在")
         if row["device_id"] == device_id:
             raise BoardError(400, "self_report", "不能举报自己的内容")
         reason = reason.strip()[:200] or "unspecified"
         self._write_rate_check(device_id, ip)
         self._rate_check("report", device_id=device_id)
+        binding = self.db.one("SELECT phone_hash FROM identity_bindings WHERE device_id=?", (device_id,))
+        eligible = int(not self._is_new(d))
         auto_hidden = False
         with self.db.tx() as c:
             c.execute(
-                "INSERT OR IGNORE INTO reports(target_type, target_id, device_id, reason, created_at) VALUES(?,?,?,?,?)",
-                (kind, target_id, device_id, reason, now()),
+                "INSERT OR IGNORE INTO reports(target_type, target_id, device_id, reason, created_at, ip, phone_hash, eligible) VALUES(?,?,?,?,?,?,?,?)",
+                (kind, target_id, device_id, reason, now(), ip, binding["phone_hash"] if binding else None, eligible),
             )
             count = c.execute("SELECT COUNT(*) FROM reports WHERE target_type=? AND target_id=?", (kind, target_id)).fetchone()[0]
             c.execute(f"UPDATE {table} SET report_count=? WHERE {key}=?", (count, target_id))
-            if count >= self.s.report_hide_threshold and row["status"] == VISIBLE:
+            devices, ips, phones = c.execute(
+                "SELECT COUNT(DISTINCT device_id), COUNT(DISTINCT ip), COUNT(DISTINCT phone_hash) "
+                "FROM reports WHERE target_type=? AND target_id=? AND eligible=1",
+                (kind, target_id),
+            ).fetchone()
+            threshold = self.s.report_hide_threshold
+            enough = devices >= threshold and ips >= threshold and (self.s.profile != "cn" or phones >= threshold)
+            if enough and row["status"] == VISIBLE:
                 c.execute(f"UPDATE {table} SET status=? WHERE {key}=?", (HIDDEN, target_id))
                 if kind == "comment":
                     c.execute("UPDATE threads SET comment_count=comment_count-1 WHERE thread_id=?", (row["thread_id"],))
                 auto_hidden = True
-        self._log("report", device_id, ip, target_id, {"kind": kind, "reason": reason})
-        return {"ok": True, "report_count": count, "auto_hidden": auto_hidden}
+        self._log("report", device_id, ip, target_id, {"kind": kind, "reason": reason, "eligible": eligible})
+        return {"ok": True, "auto_hidden": auto_hidden}
 
     def block(self, device_id: str, ip: str, thread_id: str, alias_id: str) -> dict:
         """Block is scoped to one thread on purpose: a cross-thread block
         would make the blocked person's posts vanish from other threads too,
         which lets the blocker link that person's aliases across threads."""
         self._writer(device_id, ip)
+        t = self.db.one("SELECT * FROM threads WHERE thread_id=?", (thread_id,))
+        if t is None or not self._visible(t, device_id):
+            raise BoardError(404, "not_found", "帖子不存在")
         if alias_id != "*":
             a = self.db.one("SELECT * FROM thread_aliases WHERE alias_id=? AND thread_id=?", (alias_id, thread_id))
             if a is None:
                 raise BoardError(404, "not_found", "昵称不存在")
             if a["device_id"] == device_id:
                 raise BoardError(400, "self_block", "不能屏蔽自己")
-        elif self.db.one("SELECT 1 FROM threads WHERE thread_id=?", (thread_id,)) is None:
-            raise BoardError(404, "not_found", "帖子不存在")
         self._rate_check("block", device_id=device_id)
         self.db.execute(
             "INSERT OR IGNORE INTO blocks(device_id, thread_id, alias_id, created_at) VALUES(?,?,?,?)",
@@ -438,11 +479,19 @@ class Board:
         if not m:
             raise BoardError(400, "invalid_phone", "请输入中国大陆手机号")
         e164 = "+86" + m.group(1)
-        self._rate_check("otp_start", device_id=device_id)
         phone_hash = self._phone_hash(e164)
-        bound = self.db.scalar("SELECT COUNT(*) FROM identity_bindings WHERE phone_hash=?", (phone_hash,))
-        if bound >= self.s.max_devices_per_phone:
-            raise BoardError(409, "phone_device_limit", "该手机号绑定的设备已达上限")
+        # Count the attempt before any check so probing is rate-limited, and
+        # never reveal whether a number is already bound (that is enforced in
+        # phone_verify, after possession of the phone is proven).
+        self._rate_check("otp_start", device_id=device_id)
+        self._log("otp_start", device_id, ip, meta={"phone_hash": phone_hash})
+        sends_to_phone = self.db.scalar(
+            "SELECT COUNT(*) FROM events WHERE action='otp_start' AND meta LIKE ? AND ts>?",
+            (f'%"{phone_hash}"%', now() - 3600),
+        )
+        if sends_to_phone > self.s.rate_limits["otp_start"][0]:
+            # Silently drop: the caller learns nothing, the phone is not spammed.
+            return {"ok": True, "expires_in": OTP_TTL}
         code = f"{secrets.randbelow(1_000_000):06d}"
         assert self.fernet is not None
         self.db.execute(
@@ -450,7 +499,6 @@ class Board:
             (device_id, phone_hash, self.fernet.encrypt(e164.encode()).decode(), self._phone_hash(code), now() + OTP_TTL),
         )
         self.sms.send(e164, code)
-        self._log("otp_start", device_id, ip)
         return {"ok": True, "expires_in": OTP_TTL}
 
     def phone_verify(self, device_id: str, ip: str, code: str) -> dict:
@@ -462,6 +510,12 @@ class Board:
         if not hmac.compare_digest(ch["code_hash"], self._phone_hash(code.strip())):
             self.db.execute("UPDATE otp_challenges SET attempts=attempts+1 WHERE device_id=?", (device_id,))
             raise BoardError(400, "otp_wrong", "验证码错误")
+        bound = self.db.scalar(
+            "SELECT COUNT(*) FROM identity_bindings WHERE phone_hash=? AND device_id<>?", (ch["phone_hash"], device_id)
+        )
+        if bound >= self.s.max_devices_per_phone:
+            self.db.execute("DELETE FROM otp_challenges WHERE device_id=?", (device_id,))
+            raise BoardError(409, "phone_device_limit", "该手机号绑定的设备已达上限")
         with self.db.tx() as c:
             c.execute(
                 "INSERT OR REPLACE INTO identity_bindings(device_id, phone_hash, phone_enc, verified_at) VALUES(?,?,?,?)",
@@ -598,11 +652,14 @@ class Board:
         return result
 
     # ------------------------------------------------------------- nonces
-    def consume_nonce(self, nonce: str, ts: float) -> bool:
-        """True if the nonce was fresh. Nonces expire after 2*max_skew."""
+    def consume_nonce(self, device_id: str, nonce: str, ts: float) -> bool:
+        """True if the nonce was fresh for this device. Expired nonces are
+        purged opportunistically so the table stays bounded without a cron."""
         try:
             with self.db.tx() as c:
-                c.execute("INSERT INTO nonces(nonce, ts) VALUES(?,?)", (nonce, ts))
+                if secrets.randbelow(64) == 0:
+                    c.execute("DELETE FROM nonces WHERE ts<?", (now() - 2 * self.s.signature_max_skew,))
+                c.execute("INSERT INTO nonces(device_id, nonce, ts) VALUES(?,?,?)", (device_id, nonce, ts))
         except Exception as exc:  # sqlite3.IntegrityError
             if "UNIQUE" in str(exc) or "unique" in str(exc):
                 return False

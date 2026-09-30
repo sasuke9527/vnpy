@@ -99,17 +99,64 @@ def test_unregistered_device_cannot_post(client):
     assert r.status_code == 401 and r.json()["error"] == "unregistered"
 
 
-def test_replay_rejected(client):
+def test_replay_rejected_for_writes_only(client):
     alice = new_device(client)
-    r1 = alice.request("GET", "/v1/me", nonce="fixed-nonce-1234")
-    r2 = alice.request("GET", "/v1/me", nonce="fixed-nonce-1234")
+    body = {"public_key": alice.key.public_key_b64u, "terms_version": "2026-09"}
+    r1 = alice.request("POST", "/v1/devices", body, nonce="fixed-nonce-1234")
+    r2 = alice.request("POST", "/v1/devices", body, nonce="fixed-nonce-1234")
     assert r1.status_code == 200 and r2.status_code == 401 and r2.json()["error"] == "replay"
+    # reads are idempotent and do not burn a nonce (nor a write transaction)
+    assert alice.request("GET", "/v1/me", nonce="read-nonce-1234").status_code == 200
+    assert alice.request("GET", "/v1/me", nonce="read-nonce-1234").status_code == 200
 
 
-def test_stale_timestamp_rejected(client):
+def test_stale_timestamp_rejected_with_server_time_hint(client):
     alice = new_device(client)
     r = alice.request("GET", "/v1/me", ts=1_000_000)
     assert r.status_code == 401 and r.json()["error"] == "bad_signature"
+    assert abs(r.json()["server_time"] - __import__("time").time()) < 5
+    assert "server_time" in client.get("/v1/config").json()
+
+
+def test_malformed_signing_input_never_500s(client, board):
+    alice = new_device(client)
+    huge = alice.key.sign_headers("GET", "/v1/me")
+    huge["X-Device-Ts"] = "1" + "0" * 400
+    assert client.get("/v1/me", headers=huge).status_code == 401
+    assert client.get("/admin/queue", headers={b"x-admin-token": b"\xff\xfe"}).status_code == 401
+    d = Device(client)
+    r = d.request("POST", "/v1/devices", {"public_key": "A", "terms_version": "2026-09"})
+    assert r.status_code == 400 and r.json()["error"] == "bad_public_key"
+    # a sloppy but decodable key string is stored in canonical form, not verbatim
+    key = d.key.public_key_b64u
+    sloppy = key[:10] + " " + key[10:] + "=="
+    assert d.request("POST", "/v1/devices", {"public_key": sloppy, "terms_version": "2026-09"}).status_code == 200
+    assert board.db.scalar("SELECT public_key FROM devices WHERE device_id=?", (d.device_id,)) == key
+
+
+def test_forwarded_header_ignored_from_untrusted_peer():
+    settings = make_settings(trusted_proxies=())
+    settings.rate_limits["register_ip"] = (2, 3600)
+    with TestClient(create_app(settings)) as client:
+        new_device(client, ip="198.51.100.1")
+        new_device(client, ip="198.51.100.2")
+        d = Device(client, ip="198.51.100.3")
+        r = d.request("POST", "/v1/devices", {"public_key": d.key.public_key_b64u, "terms_version": "2026-09"})
+        assert r.status_code == 429  # all three came from the same TCP peer
+        board = client.app.state.board
+        assert board.db.scalar("SELECT DISTINCT first_ip FROM devices") == "testclient"
+
+
+def test_admin_identity_comes_from_token_not_header(client):
+    settings = make_settings(admin_tokens={"mod-2": "tok2"})
+    with TestClient(create_app(settings)) as c:
+        alice = new_device(c)
+        tid = alice.post_thread("x").json()["thread"]["thread_id"]
+        hdrs = {"X-Admin-Token": "tok2", "X-Admin-Id": "someone-else"}
+        assert c.get(f"/admin/trace/thread/{tid}?case_ref=C&reason=r", headers=hdrs).status_code == 200
+        assert c.get("/admin/audit", headers=hdrs).json()[0]["admin"] == "mod-2"
+        c.post(f"/admin/devices/{alice.device_id}/ban", json={"hours": 1, "reason": "x"}, headers={"X-Admin-Token": "admin-secret", "X-Admin-Id": "spoof"})
+        assert c.get("/admin/audit", headers=hdrs).json()[0]["admin"] == "admin"
 
 
 def test_register_key_mismatch(client):
@@ -164,13 +211,16 @@ def test_three_reports_auto_hide_and_admin_can_restore(client, admin_headers):
         first = r.request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid, "reason": "骚扰"})
         # duplicate report from the same device must not count twice
         again = r.request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid, "reason": "骚扰"})
-        assert first.status_code == again.status_code == 200
-        assert first.json()["report_count"] == again.json()["report_count"] == i + 1
+        assert first.status_code == 200 and again.status_code == (200 if i < 2 else 404)
+        assert "report_count" not in first.json()  # never disclose counts to users
         assert first.json()["auto_hidden"] is (i == 2)
+        if i < 2:
+            assert again.json()["auto_hidden"] is False
     assert client.get(f"/v1/threads/{tid}").status_code == 404
     assert alice.thread(tid).json()["thread"]["status"] == "hidden"
 
-    assert reporters[0].request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid}).status_code == 200
+    # hidden content is invisible to reporters too: no status oracle
+    assert reporters[0].request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid}).status_code == 404
     assert alice.request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid}).status_code == 400
 
     q = client.get("/admin/queue", headers=admin_headers).json()
@@ -178,7 +228,44 @@ def test_three_reports_auto_hide_and_admin_can_restore(client, admin_headers):
     client.post(f"/admin/content/thread/{tid}", json={"action": "restore", "reason": "no violation"}, headers=admin_headers)
     assert client.get(f"/v1/threads/{tid}").status_code == 200
     audit = client.get("/admin/audit", headers=admin_headers).json()
-    assert audit[0]["action"] == "content.restore" and audit[0]["admin"] == "mod-1"
+    assert audit[0]["action"] == "content.restore" and audit[0]["admin"] == "admin"  # from the token, not X-Admin-Id
+
+
+def test_report_votes_need_distinct_ips_and_established_devices(client):
+    alice = new_device(client)
+    tid = alice.post_thread("target").json()["thread"]["thread_id"]
+    # three devices behind one IP: recorded for the queue, but no auto-hide
+    for _ in range(3):
+        r = new_device(client, ip="198.51.100.7").request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid})
+        assert r.status_code == 200 and r.json()["auto_hidden"] is False
+    assert client.get(f"/v1/threads/{tid}").status_code == 200
+    # two more from distinct IPs -> 5 devices, 3 IPs -> hidden
+    new_device(client, ip="198.51.100.8").request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid})
+    r = new_device(client, ip="198.51.100.9").request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid})
+    assert r.json()["auto_hidden"] is True
+
+    # brand-new devices never count toward auto-hide
+    settings = make_settings(new_device_hours=24)
+    with TestClient(create_app(settings)) as c:
+        author = new_device(c)
+        tid = author.post_thread("target").json()["thread"]["thread_id"]
+        for i in range(3):
+            r = new_device(c, ip=f"198.51.100.{20 + i}").request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid})
+            assert r.status_code == 200 and r.json()["auto_hidden"] is False
+        assert c.get(f"/v1/threads/{tid}").status_code == 200
+        q = c.get("/admin/queue", headers={"X-Admin-Token": "admin-secret"}).json()
+        assert q["threads"] == []  # still visible, so not in the hidden queue
+        assert c.app.state.board.db.scalar("SELECT report_count FROM threads WHERE thread_id=?", (tid,)) == 3
+
+
+def test_report_and_block_do_not_reveal_invisible_content(client):
+    alice, bob = new_device(client), new_device(client, ip="203.0.113.11")
+    held = alice.post_thread("公司内部消息：下周裁员").json()["thread"]["thread_id"]
+    gone = alice.post_thread("bye").json()["thread"]["thread_id"]
+    alice.request("DELETE", f"/v1/threads/{gone}")
+    for tid in (held, gone, "0" * 32):
+        assert bob.request("POST", "/v1/reports", {"target_type": "thread", "target_id": tid}).status_code == 404
+        assert bob.request("POST", f"/v1/threads/{tid}/blocks", {"alias_id": "*"}).status_code == 404
 
 
 def test_comment_reports_adjust_counts(client):
@@ -271,8 +358,13 @@ def test_feed_pagination(client):
     ids = [alice.post_thread(f"t{i}").json()["thread"]["thread_id"] for i in range(5)]
     page = client.get("/v1/threads?limit=2").json()
     assert [t["thread_id"] for t in page["threads"]] == ids[4:2:-1]
-    page2 = client.get(f"/v1/threads?limit=2&before={page['next_before']}").json()
-    assert len(page2["threads"]) == 2 and page2["threads"][0]["thread_id"] not in [t["thread_id"] for t in page["threads"]]
+    cursor = page["next_cursor"]
+    assert cursor and "." not in cursor and str(int(alice.client.app.state.board.db.scalar("SELECT created_at FROM threads LIMIT 1"))) not in cursor
+    page2 = client.get(f"/v1/threads?limit=2&cursor={cursor}").json()
+    assert [t["thread_id"] for t in page2["threads"]] == ids[2:0:-1]
+    page3 = client.get(f"/v1/threads?limit=2&cursor={page2['next_cursor']}").json()
+    assert [t["thread_id"] for t in page3["threads"]] == ids[0:1] and page3["next_cursor"] is None
+    assert client.get("/v1/threads?cursor=not-a-cursor").status_code == 400
 
 
 def test_reply_to_must_exist_in_thread(client):
@@ -317,11 +409,15 @@ def test_admin_ban_and_shadow_ban(client, admin_headers):
 
     client.post(f"/admin/devices/{bob.device_id}/ban", json={"hours": 1, "reason": "spam", "shadow": True}, headers=admin_headers)
     r = bob.post_thread("shadow")
-    assert r.status_code == 201 and r.json()["thread"]["status"] == "shadow"
+    # the shadow-banned author sees nothing unusual
+    assert r.status_code == 201 and r.json()["thread"]["status"] == "visible"
     tid = r.json()["thread"]["thread_id"]
-    assert bob.thread(tid).status_code == 200
+    assert bob.thread(tid).json()["thread"]["status"] == "visible"
+    assert bob.request("GET", "/v1/threads").json()["threads"][0]["status"] == "visible"
+    assert bob.comment(tid, "c").json()["status"] == "visible"
     assert client.get(f"/v1/threads/{tid}").status_code == 404
     assert bob.request("GET", "/v1/me").json()["banned_until"] is None
+    assert client.app.state.board.db.scalar("SELECT status FROM threads WHERE thread_id=?", (tid,)) == "shadow"
 
 
 def test_purge_removes_old_events_and_deleted_bodies(client, board, admin_headers):
@@ -375,10 +471,18 @@ def test_cn_profile_requires_phone_binding_and_bans_follow_the_phone():
         client.post(f"/admin/devices/{alice.device_id}/ban", json={"hours": 1, "reason": "abuse"}, headers={"X-Admin-Token": "admin-secret"})
         assert bob.post_thread("bob again").json()["error"] == "banned"
 
-        # device limit per phone
+        # device limit per phone is enforced only after the code proves possession,
+        # so the start call never tells a stranger whether a number is bound
         settings.max_devices_per_phone = 2
         carol = new_device(client, ip="203.0.113.12")
-        assert carol.request("POST", "/v1/me/phone/start", {"phone": "13800138000"}).json()["error"] == "phone_device_limit"
+        assert carol.request("POST", "/v1/me/phone/start", {"phone": "13800138000"}).status_code == 200
+        r = carol.request("POST", "/v1/me/phone/verify", {"code": sms.sent[-1][1]})
+        assert r.status_code == 409 and r.json()["error"] == "phone_device_limit"
+        # per-phone send cap: further starts return 200 but stop sending SMS
+        before = len(sms.sent)
+        for _ in range(8):
+            carol.request("POST", "/v1/me/phone/start", {"phone": "13800138000"})
+        assert len(sms.sent) - before <= 3
 
 
 def test_overseas_profile_rejects_phone_flow(client):

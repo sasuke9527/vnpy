@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS reports (
     device_id   TEXT NOT NULL,
     reason      TEXT NOT NULL,
     created_at  REAL NOT NULL,
+    ip          TEXT,
+    phone_hash  TEXT,
+    eligible    INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (target_type, target_id, device_id)
 );
 CREATE TABLE IF NOT EXISTS blocks (
@@ -109,9 +112,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     result   TEXT
 );
 CREATE TABLE IF NOT EXISTS nonces (
-    nonce TEXT PRIMARY KEY,
-    ts    REAL NOT NULL
+    device_id TEXT NOT NULL,
+    nonce     TEXT NOT NULL,
+    ts        REAL NOT NULL,
+    PRIMARY KEY (device_id, nonce)
 );
+CREATE INDEX IF NOT EXISTS ix_nonces_ts ON nonces(ts);
 """
 
 

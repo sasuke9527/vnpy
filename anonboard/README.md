@@ -13,7 +13,7 @@
 cd anonboard
 pip install -r requirements.txt
 python -m anonboard            # http://127.0.0.1:8080
-python -m pytest -q tests      # 42 个单元/集成测试 + 1 个 Chromium 端到端测试（需要 playwright）
+python -m pytest -q tests      # 47 个单元/集成测试 + 1 个 Chromium 端到端测试（需要 playwright）
 ```
 
 环境变量（都有默认值，生产必须显式设置）：
@@ -24,7 +24,9 @@ python -m pytest -q tests      # 42 个单元/集成测试 + 1 个 Chromium 端�
 | `ANONBOARD_DB` | SQLite 路径，默认 `anonboard.db` |
 | `ANONBOARD_ALIAS_PEPPER` | 32 字节 hex，派生帖内昵称的服务端密钥（未设置时生成到 `*.alias.pepper` 文件） |
 | `ANONBOARD_PHONE_PEPPER` / `ANONBOARD_PHONE_ENC_KEY` | 手机号哈希与加密密钥（`cn` 档位） |
-| `ANONBOARD_ADMIN_TOKEN` | 管理接口令牌，请求头 `X-Admin-Token` |
+| `ANONBOARD_ADMIN_TOKENS` | 每个管理员一个令牌：`alice:tok1,bob:tok2`。审计日志里的管理员身份由匹配的令牌决定，客户端自报的名字不采信 |
+| `ANONBOARD_ADMIN_TOKEN` | 单令牌兼容写法（记为 `admin`），请求头 `X-Admin-Token` |
+| `ANONBOARD_TRUSTED_PROXIES` | 可信反向代理的 IP/CIDR 列表。只有 TCP 对端在列表内时才采信 `X-Forwarded-For`，否则任何人都能伪造 IP 绕过限流、污染调取记录 |
 | `ANONBOARD_CONTACT_EMAIL` | 展示给用户的举报/申诉邮箱（App Store 1.2 要求） |
 | `ANONBOARD_RETENTION_DAYS` | 日志留存天数，默认 180（网络安全法第 21 条：不少于六个月） |
 | `ANONBOARD_REPORT_HIDE_THRESHOLD` | 多少个不同设备举报后自动隐藏并进入人工审核，默认 3 |
@@ -40,9 +42,11 @@ python -m pytest -q tests      # 42 个单元/集成测试 + 1 个 Chromium 端�
 ```
 X-Device-Key   base64url(65 字节未压缩公钥)
 X-Device-Ts    Unix 秒
-X-Device-Nonce 随机数（服务端 10 分钟内拒绝重复）
+X-Device-Nonce 随机数（写请求 10 分钟内拒绝重复；读请求是幂等的，不消耗）
 X-Device-Sig   base64url(r||s)   对 "ts\nnonce\nMETHOD\npath?query\nsha256(body)" 的 ECDSA-SHA256 签名
 ```
+
+服务端对线上的原始路径与查询串验签；时钟偏差过大时 401 响应和 `/v1/config` 都带 `server_time`，客户端据此校正后重试。
 
 服务端只保存 `device_id = SHA-256("anonboard:device:v1:" || 公钥)`。没有手机号、邮箱、密码，也没有可找回的账号——
 换机或卸载后就是一个新的人（这正是无秘那类产品的用户预期）。
@@ -81,7 +85,9 @@ hue  = seed[4:6] mod 360                                # 头像颜色
 
 * 限流：按设备、按 IP、新设备（24 小时内）更严；
 * 内容前置检查：手机号/身份证/银行卡号直接拒绝（反人肉），敏感词先审后发（仅作者可见）；
-* 举报：3 个不同设备举报即自动隐藏并进入 `/admin/queue`，管理员可恢复/删除；
+* 举报：只有注册满 24 小时的设备的票有效，有效票来自 ≥3 个设备且 ≥3 个不同 IP（`cn` 档位还要 ≥3 个不同手机号）才自动隐藏并进入 `/admin/queue`，管理员可恢复/删除；三个免费设备刷不掉别人的帖子；用户看不到举报计数；
+* 对隐藏、待审、影子、已删除的内容，举报与屏蔽接口返回与"不存在"相同的 404，不给状态探测口子；影子封禁的作者在所有响应里看到自己的内容一切正常；
+* 手机绑定的 `start` 永远返回 200，"号码已绑满设备"只在验证码通过后才判断，陌生人无法探测某个号码是否在用；
 * 封禁与影子封禁；作者可删除自己的内容；
 * 日志：所有写操作记录 `(时间, 设备, IP, 动作)`，`/admin/maintenance/purge` 按留存期清理；
 * 合法调取：`/admin/trace/{thread|comment}/{id}?case_ref=…&reason=…` 必须填案件编号，每次调取写入 `audit_log`；
@@ -94,12 +100,12 @@ hue  = seed[4:6] mod 360                                # 头像颜色
 | GET | `/v1/config` | 否 | 档位、条款版本、联系邮箱、限制 |
 | POST | `/v1/devices` | 是 | 注册设备（`public_key`, `terms_version`, 可选 `attestation`） |
 | GET | `/v1/me` | 是 | 设备状态：是否已绑手机、能否发言、封禁截止 |
-| GET | `/v1/threads?before=&limit=` | 可选 | 信息流；签名时会隐藏你"不看"的帖子并显示你自己的待审内容 |
+| GET | `/v1/threads?cursor=&limit=` | 可选 | 信息流，不透明游标（不暴露精确时间）；签名时会隐藏你"不看"的帖子并显示你自己的待审内容 |
 | POST | `/v1/threads` | 是 | 发帖 `{body}` |
 | GET | `/v1/threads/{id}` | 可选 | 帖子 + 评论；签名时含 `my_alias`（你在本帖的昵称预览）与 `is_me` |
 | POST | `/v1/threads/{id}/comments` | 是 | 回复 `{body, reply_to?}` |
 | DELETE | `/v1/threads/{id}` / `.../comments/{cid}` | 是 | 删除自己的内容 |
-| POST | `/v1/reports` | 是 | 举报 `{target_type, target_id, reason}` |
+| POST | `/v1/reports` | 是 | 举报 `{target_type, target_id, reason}`，返回 `{ok, auto_hidden}` |
 | POST | `/v1/threads/{id}/blocks` | 是 | 屏蔽 `{alias_id}`；`"*"` 表示不看此帖 |
 | POST | `/v1/me/phone/start` / `verify` | 是 | `cn` 档位的手机绑定 |
 | GET/POST | `/admin/...` | `X-Admin-Token` | 审核队列、内容处置、封禁、合法调取、审计、留存清理 |

@@ -82,7 +82,7 @@
   const $ = (id) => document.getElementById(id);
   const enc = new TextEncoder();
   let privateKey = null, pubRaw = null, config = null, me = null;
-  let currentThread = null, replyTo = null, nextBefore = null;
+  let currentThread = null, replyTo = null, nextCursor = null, clockOffset = 0;
 
   const b64u = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(s.length + (4 - s.length % 4) % 4, '=')), c => c.charCodeAt(0));
@@ -107,10 +107,10 @@
     }
   }
 
-  async function signedFetch(method, path, body) {
+  async function signedFetch(method, path, body, retried) {
     const raw = body === undefined ? '' : JSON.stringify(body);
     const bodyHash = hex(await crypto.subtle.digest('SHA-256', enc.encode(raw)));
-    const ts = Math.floor(Date.now() / 1000);
+    const ts = Math.floor(Date.now() / 1000) + clockOffset;
     const nonce = b64u(crypto.getRandomValues(new Uint8Array(16)));
     const msg = enc.encode([ts, nonce, method.toUpperCase(), path, bodyHash].join('\n'));
     const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, msg);
@@ -120,6 +120,11 @@
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await fetch(path, { method, headers, body: body === undefined ? undefined : raw });
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401 && data.server_time && !retried) {
+      // device clock is off: learn the offset from the server and retry once
+      clockOffset = data.server_time - Math.floor(Date.now() / 1000);
+      return signedFetch(method, path, body, true);
+    }
     if (!res.ok) throw Object.assign(new Error(data.message || res.statusText), { data, status: res.status });
     return data;
   }
@@ -147,7 +152,7 @@
   }
 
   async function loadFeed(append) {
-    const path = '/v1/threads?limit=20' + (append && nextBefore ? '&before=' + nextBefore : '');
+    const path = '/v1/threads?limit=20' + (append && nextCursor ? '&cursor=' + encodeURIComponent(nextCursor) : '');
     const data = await signedFetch('GET', path);
     if (!append) $('threads').innerHTML = '';
     for (const t of data.threads) {
@@ -157,8 +162,8 @@
       el.onclick = () => openThread(t.thread_id);
       $('threads').appendChild(el);
     }
-    nextBefore = data.next_before;
-    $('more').classList.toggle('hidden', !nextBefore);
+    nextCursor = data.next_cursor;
+    $('more').classList.toggle('hidden', !nextCursor);
   }
 
   async function openThread(id) {
@@ -253,6 +258,7 @@
   (async () => {
     try {
       config = await (await fetch('/v1/config')).json();
+      if (config.server_time) clockOffset = config.server_time - Math.floor(Date.now() / 1000);
       $('footer').textContent = `举报与申诉：${config.contact_email} · 社区规范 ${config.terms_version} · 禁止发布他人隐私、针对具体个人或公司的指控与谣言`;
       await loadKey();
       await register();

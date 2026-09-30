@@ -41,6 +41,12 @@ class Settings:
     # Fernet key that encrypts bound phone numbers at rest (cn profile).
     phone_enc_key: str = ""
     admin_token: str = ""
+    # name -> token. Every admin action is audited under the matching name,
+    # so give each moderator their own token (ANONBOARD_ADMIN_TOKENS="alice:tok1,bob:tok2").
+    admin_tokens: dict[str, str] = field(default_factory=dict)
+    # Peers whose X-Forwarded-For header is believed (IPs, CIDRs or literal
+    # hostnames). Empty means the header is ignored and the TCP peer is the client.
+    trusted_proxies: tuple[str, ...] = ()
     contact_email: str = "abuse@example.com"
     terms_version: str = "2026-09"
     retention_days: int = 180          # 网络安全法 第21条: logs >= 6 months
@@ -56,6 +62,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
             raise ValueError(f"profile must be one of {PROFILES}, got {self.profile!r}")
+        if self.admin_token and "admin" not in self.admin_tokens:
+            self.admin_tokens = {**self.admin_tokens, "admin": self.admin_token}
 
 
 def _secret_from_env_or_file(env: Mapping[str, str], var: str, path: Path, nbytes: int = 32) -> bytes:
@@ -94,10 +102,17 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
                 key_path.chmod(0o600)
             except OSError:
                 pass
+    admin_tokens: dict[str, str] = {}
+    for item in (env.get("ANONBOARD_ADMIN_TOKENS") or "").split(","):
+        if ":" in item:
+            name, token = item.split(":", 1)
+            if name.strip() and token.strip():
+                admin_tokens[name.strip()] = token.strip()
     admin_token = env.get("ANONBOARD_ADMIN_TOKEN") or ""
-    if not admin_token:
+    if not admin_token and not admin_tokens:
         admin_token = secrets.token_urlsafe(24)
         warnings.warn("ANONBOARD_ADMIN_TOKEN not set; generated one for this process only", stacklevel=2)
+    trusted_proxies = tuple(p.strip() for p in (env.get("ANONBOARD_TRUSTED_PROXIES") or "").split(",") if p.strip())
     return Settings(
         profile=env.get("ANONBOARD_PROFILE", "overseas"),
         db_path=db_path,
@@ -105,6 +120,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         phone_pepper=phone_pepper,
         phone_enc_key=phone_enc_key,
         admin_token=admin_token,
+        admin_tokens=admin_tokens,
+        trusted_proxies=trusted_proxies,
         contact_email=env.get("ANONBOARD_CONTACT_EMAIL", "abuse@example.com"),
         terms_version=env.get("ANONBOARD_TERMS_VERSION", "2026-09"),
         retention_days=int(env.get("ANONBOARD_RETENTION_DAYS", "180")),

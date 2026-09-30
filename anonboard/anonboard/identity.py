@@ -92,15 +92,19 @@ def verify_headers(headers, method: str, path: str, body: bytes, *, max_skew: in
     uniqueness) is the caller's job because it needs storage."""
     try:
         key_raw = b64u_decode(headers[HDR_KEY])
-        ts = int(headers[HDR_TS])
+        ts_text = headers[HDR_TS]
+        if len(ts_text) > 20 or not ts_text.isdigit():
+            raise ValueError("bad timestamp")
+        ts = int(ts_text)
         nonce = headers[HDR_NONCE]
         sig_raw = b64u_decode(headers[HDR_SIG])
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, TypeError) as exc:  # binascii.Error is a ValueError
         raise SignatureError("missing or malformed signing headers") from exc
     if not (8 <= len(nonce) <= 64):
         raise SignatureError("nonce length")
     now = time.time() if now is None else now
-    if abs(now - ts) > max_skew:
+    # int/float comparison is exact in Python; subtraction could overflow.
+    if ts < now - max_skew or ts > now + max_skew:
         raise SignatureError("timestamp outside allowed skew")
     verify(key_raw, sig_raw, canonical_string(ts, nonce, method, path, body))
     return SignedIdentity(device_id=device_id_for(key_raw), public_key_raw=key_raw, ts=ts, nonce=nonce)

@@ -24,6 +24,7 @@ def make_settings(profile: str = "overseas", **overrides) -> Settings:
         admin_token="admin-secret",
         terms_version=TERMS,
         new_device_hours=0,  # most tests are not about new-device throttles
+        trusted_proxies=("testclient",),  # TestClient's peer; lets tests fake client IPs via X-Forwarded-For
     )
     base.update(overrides)
     return Settings(**base)
